@@ -1,0 +1,7 @@
+__pycache__
+venv
+.venv
+.clojure-mcp
+chat_history.jsonl
+last_response.md
+

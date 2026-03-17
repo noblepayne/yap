@@ -1,0 +1,20 @@
+[project]
+name = "yap"
+version = "0.1.0"
+description = "A lightweight TUI for testing LLM endpoints and proxies"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=8.1.1",
+    "requests>=2.32.5",
+    "textual-fspicker>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

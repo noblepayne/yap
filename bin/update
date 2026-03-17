@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# This script should be run from within: nix develop
+# Or with: nix develop -c ./bin/update
+
+echo "=== Updating yap dependencies ==="
+
+echo "1. Running uv lock --upgrade..."
+uv lock --upgrade
+
+echo "2. Exporting requirements.txt..."
+uv export --no-dev --no-editable -o requirements.txt
+
+echo "3. Removing stray '.' from requirements.txt..."
+sed -i '/^\\.$/d' requirements.txt
+sed -i '/^\.$/d' requirements.txt
+
+echo "4. Building FOD to get hash..."
+nix build .#deps
+DEPSPATH=$(nix path-info .#deps)
+HASH=$(nix hash path "$DEPSPATH")
+echo "   Got hash: $HASH"
+
+echo "5. Updating flake.nix..."
+sed -i "s|outputHash = \".*\";|outputHash = \"$HASH\";|" flake.nix
+
+echo "=== Done! ==="
+echo "Commit the following files:"
+echo "  - pyproject.toml"
+echo "  - uv.lock"
+echo "  - requirements.txt"
+echo "  - flake.nix"
