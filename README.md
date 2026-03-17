@@ -32,11 +32,18 @@ nix develop
 ./yap.py
 ```
 
-### Manual
+### Manual (uv)
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+uv sync
+./yap.py
+```
+
+### Manual (pip)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -67,6 +74,15 @@ Environment variables. That's it.
 | `CHAT_CURL_HISTORY_FILE` | `chat_history.jsonl` | Where messages go |
 | `CHAT_CURL_LAST_RESPONSE_FILE` | `last_response.md` | Last response output |
 | `CHAT_CURL_MAX_HISTORY` | `50` | Messages to keep |
+
+### Updating Dependencies
+
+```bash
+# In nix develop shell:
+./bin/update
+```
+
+This updates `uv.lock`, `requirements.txt`, and the Nix FOD hash.
 
 ## Keys
 
