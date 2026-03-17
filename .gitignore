@@ -4,4 +4,4 @@ venv
 .clojure-mcp
 chat_history.jsonl
 last_response.md
-
+result
