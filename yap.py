@@ -107,6 +107,13 @@ def _parse_response(data: dict) -> dict:
     if "content" in message and message["content"]:
         message["content"] = _strip_ansi(str(message["content"]))
 
+    # Clean reasoning_content if present
+    if "reasoning_content" in message and message["reasoning_content"]:
+        message["reasoning_content"] = _strip_ansi(str(message["reasoning_content"]))
+
+    if "thought" in message and message["thought"]:
+        message["thought"] = _strip_ansi(str(message["thought"]))
+
     return message
 
 
@@ -127,22 +134,40 @@ def _format_chat_display(history: list) -> str:
         role = msg.get("role", "UNKNOWN").upper()
         content = msg.get("content") or ""
         tool_calls = msg.get("tool_calls")
+        reasoning = msg.get("reasoning_content") or msg.get("thought")
 
         # Strip ANSI from content
         display_content = _strip_ansi(str(content))
 
+        # Expert Transparency: Handle reasoning/thoughts (DeepSeek/O1 style)
+        if reasoning:
+            reasoning_text = _strip_ansi(str(reasoning))
+            display_content = f"THOUGHTS:\n{reasoning_text}\n\n{display_content}"
+
         # Handle tool calls in assistant messages
         if tool_calls:
             try:
-                calls_str = json.dumps(tool_calls, indent=2)
-                display_content += f"\n[TOOL CALLS]\n{calls_str}"
+                # Expert transparency: include IDs for easier proxy/injector log matching
+                calls_formatted = []
+                for call in tool_calls:
+                    call_id = call.get("id", "no-id")
+                    func = call.get("function", {})
+                    name = func.get("name", "unknown")
+                    args = func.get("arguments", "{}")
+                    calls_formatted.append(f"[CALL:{call_id}] {name}({args})")
+                
+                calls_str = "\n".join(calls_formatted)
+                display_content += f"\n\n[TOOL CALLS]\n{calls_str}"
             except Exception:
-                display_content += f"\n[TOOL CALLS] {tool_calls}"
+                display_content += f"\n\n[TOOL CALLS] {tool_calls}"
 
         # Handle tool role messages
         if role == "TOOL":
             tool_name = msg.get("name", "unknown")
-            formatted.append(f"[TOOL: {tool_name}]\n{display_content}\n" + ("-" * 40))
+            tool_id = msg.get("tool_call_id", "no-id")
+            formatted.append(
+                f"[TOOL: {tool_name} | ID: {tool_id}]\n{display_content}\n" + ("-" * 40)
+            )
         else:
             formatted.append(f"[{role}]\n{display_content}\n" + ("-" * 40))
 
@@ -158,7 +183,27 @@ def _count_context(system_prompt: str, history: list) -> tuple[int, int]:
     """Count chars and estimated tokens in context."""
     chars = len(system_prompt)
     for msg in history:
-        chars += len(msg.get("content", ""))
+        # Crash fix: content can be None (e.g. assistant msg with tool calls)
+        content = msg.get("content") or ""
+        chars += len(str(content))
+
+        # Expert Transparency: include tool_calls in context pressure
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            try:
+                # We serialize to get a realistic character count of what the LLM "sees"
+                chars += len(json.dumps(tool_calls))
+            except Exception:
+                pass
+
+        # Expert Transparency: include reasoning/thought if present (e.g. DeepSeek/O1)
+        reasoning = msg.get("reasoning_content") or msg.get("thought")
+        if reasoning:
+            chars += len(str(reasoning))
+
+        # Metadata overhead (approx 4 tokens / 16 chars per message)
+        chars += 16
+
     tokens = chars // 4
     return chars, tokens
 
