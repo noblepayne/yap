@@ -59,7 +59,7 @@ def test_safe_write_overwrite(tmp_path):
 
 def test_config_defaults():
     assert API_URL == "http://lattice:8089/v1/chat/completions"
-    assert TIMEOUT == 600
+    assert TIMEOUT == 3600
     assert MAX_HISTORY == 50
 
 
@@ -90,6 +90,62 @@ def test_count_context_with_history():
     chars, tokens = _count_context("", history)
     assert chars == 10
     assert tokens == 2
+
+
+def test_count_context_with_tool_calls():
+    # history with tool calls should count toward context if they have content
+    # (simplistic token counting here just counts chars in content)
+    history = [
+        {
+            "role": "assistant",
+            "content": "thinking",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "test", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "content": "result", "tool_call_id": "1", "name": "test"},
+    ]
+    chars, tokens = _count_context("", history)
+    assert chars == 14  # "thinking" + "result"
+    assert tokens == 3
+
+
+def test_format_chat_display_tool_calls():
+    _format_chat_display = yap._format_chat_display
+    history = [
+        {
+            "role": "assistant",
+            "content": "I will call a tool.",
+            "tool_calls": [
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"location": "San Francisco"}',
+                    },
+                }
+            ],
+        }
+    ]
+    formatted = _format_chat_display(history)
+    assert "[ASSISTANT]" in formatted
+    assert "I will call a tool." in formatted
+    assert "[TOOL CALLS]" in formatted
+    assert "get_weather" in formatted
+    assert "San Francisco" in formatted
+
+
+def test_format_chat_display_tool_role():
+    _format_chat_display = yap._format_chat_display
+    history = [{"role": "tool", "name": "get_weather", "content": '{"temp": 72}'}]
+    formatted = _format_chat_display(history)
+    assert "[TOOL: get_weather]" in formatted
+    assert '{"temp": 72}' in formatted
 
 
 def test_count_context_full():

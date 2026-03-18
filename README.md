@@ -70,7 +70,7 @@ Environment variables. That's it.
 | Variable | Default | What it does |
 |----------|---------|--------------|
 | `CHAT_CURL_API_URL` | `http://lattice:8089/v1/chat/completions` | Endpoint |
-| `CHAT_CURL_TIMEOUT` | `600` | Request timeout (seconds) |
+| `CHAT_CURL_TIMEOUT` | `3600` | Request timeout (seconds) |
 | `CHAT_CURL_HISTORY_FILE` | `chat_history.jsonl` | Where messages go |
 | `CHAT_CURL_LAST_RESPONSE_FILE` | `last_response.md` | Last response output |
 | `CHAT_CURL_MAX_HISTORY` | `50` | Messages to keep |
@@ -94,6 +94,9 @@ This updates `uv.lock`, `requirements.txt`, and the Nix FOD hash.
 
 ## Features
 
+- **Robust Retries** - Automatic exponential backoff for transient network errors (via `tenacity`)
+- **Tool Call Awareness** - Structured display of `tool_calls` and `tool` role messages
+- **Long-Running Workflows** - 1-hour default timeout for complex MCP tool loops
 - **Load Prompt** - Load a system prompt from a .md or .txt file
 - **Load History** - Import a previous conversation from a .jsonl file
 - **Context Stats** - See character count and estimated tokens

@@ -10,9 +10,17 @@ import os
 import re
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import requests
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -30,7 +38,7 @@ from textual.widgets import (
 from textual_fspicker import FileOpen, Filters
 
 API_URL = os.environ.get("CHAT_CURL_API_URL", "http://lattice:8089/v1/chat/completions")
-TIMEOUT = int(os.environ.get("CHAT_CURL_TIMEOUT", 600))
+TIMEOUT = int(os.environ.get("CHAT_CURL_TIMEOUT", 3600))
 HISTORY_FILE = Path(os.environ.get("CHAT_CURL_HISTORY_FILE", "chat_history.jsonl"))
 LAST_RESPONSE_FILE = Path(
     os.environ.get("CHAT_CURL_LAST_RESPONSE_FILE", "last_response.md")
@@ -85,8 +93,8 @@ def _build_payload(
     return {"model": model, "messages": payload_messages}
 
 
-def _parse_response(data: dict) -> str:
-    """Extract content from API response."""
+def _parse_response(data: dict) -> dict:
+    """Extract message object from API response."""
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         raise ValueError("Missing or empty 'choices' in response")
@@ -95,11 +103,11 @@ def _parse_response(data: dict) -> str:
     if not isinstance(message, dict):
         raise ValueError("Missing 'message' in choice")
 
-    raw_content = message.get("content")
-    if raw_content is None:
-        raise ValueError("Missing 'content' in message")
+    # Clean ANSI from content if present
+    if "content" in message and message["content"]:
+        message["content"] = _strip_ansi(str(message["content"]))
 
-    return _strip_ansi(str(raw_content))
+    return message
 
 
 def _truncate_history(history: list, max_size: int) -> list:
@@ -110,15 +118,34 @@ def _truncate_history(history: list, max_size: int) -> list:
 
 
 def _format_chat_display(history: list) -> str:
-    """Format history for display."""
+    """Format history for display with tool call awareness."""
     if not history:
         return "Session started. No messages yet."
 
     formatted = []
     for msg in history:
-        role = "USER" if msg.get("role") == "user" else "ASSISTANT"
-        content = _strip_ansi(str(msg.get("content", "")))
-        formatted.append(f"[{role}]\n{content}\n" + ("-" * 40))
+        role = msg.get("role", "UNKNOWN").upper()
+        content = msg.get("content") or ""
+        tool_calls = msg.get("tool_calls")
+
+        # Strip ANSI from content
+        display_content = _strip_ansi(str(content))
+
+        # Handle tool calls in assistant messages
+        if tool_calls:
+            try:
+                calls_str = json.dumps(tool_calls, indent=2)
+                display_content += f"\n[TOOL CALLS]\n{calls_str}"
+            except Exception:
+                display_content += f"\n[TOOL CALLS] {tool_calls}"
+
+        # Handle tool role messages
+        if role == "TOOL":
+            tool_name = msg.get("name", "unknown")
+            formatted.append(f"[TOOL: {tool_name}]\n{display_content}\n" + ("-" * 40))
+        else:
+            formatted.append(f"[{role}]\n{display_content}\n" + ("-" * 40))
+
     return "\n\n".join(formatted)
 
 
@@ -140,10 +167,31 @@ def _count_context(system_prompt: str, history: list) -> tuple[int, int]:
 
 
 def _http_chat(url: str, payload: dict, timeout: int) -> dict:
-    """Make HTTP POST to LLM endpoint."""
-    r = requests.post(url, json=payload, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+    """Make HTTP POST to LLM endpoint with retries."""
+
+    @retry(
+        retry=retry_if_exception_type(
+            (
+                requests.exceptions.RequestException,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+            )
+        ),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        stop=stop_after_attempt(5),
+        before_sleep=before_sleep_log(logging.getLogger("yap"), logging.WARNING),
+        reraise=True,
+    )
+    def _do_post():
+        r = requests.post(url, json=payload, timeout=timeout)
+        # Retry on 5xx server errors
+        if 500 <= r.status_code < 600:
+            r.raise_for_status()
+        r.raise_for_status()
+        return r.json()
+
+    return _do_post()
 
 
 def _load_history(path: Path) -> list:
@@ -364,36 +412,44 @@ class Yap(App):
             status.add_class("loading")
 
     def _action_load_prompt(self) -> None:
-        async def on_selected(path: Path) -> None:
-            try:
-                content = _load_prompt_file(path)
-                self.query_one("#system-prompt", TextArea).text = content
-                self._refresh_context_stats()
-                self._update_status_text(f"Loaded: {path.name}", "success")
-            except Exception as e:
-                self._update_status_text(f"Error loading file: {e}", "error")
-            self.pop_screen()
+        def on_selected(path: Path | None) -> None:
+            if path:
+                try:
+                    content = _load_prompt_file(path)
+                    self.query_one("#system-prompt", TextArea).text = content
+                    self._refresh_context_stats()
+                    self._update_status_text(f"Loaded: {path.name}", "success")
+                except Exception as e:
+                    self._update_status_text(f"Error loading file: {e}", "error")
 
-        picker = FileOpen(filters=Filters([("Markdown", [".md"]), ("Text", [".txt"])]))
-        picker.on_file_selected = on_selected
-        self.push_screen(picker)
+        picker = FileOpen(
+            filters=Filters(
+                ("Markdown", lambda p: p.suffix.lower() == ".md"),
+                ("Text", lambda p: p.suffix.lower() == ".txt"),
+            )
+        )
+        self.push_screen(picker, callback=on_selected)
 
     def _action_load_history(self) -> None:
-        async def on_selected(path: Path) -> None:
-            try:
-                loaded = _load_history(path)
-                self.history = _truncate_history(loaded, MAX_HISTORY)
-                self._save_history()
-                self._refresh_chat_display()
-                self._refresh_context_stats()
-                self._update_status_text(f"Loaded {len(loaded)} messages", "success")
-            except Exception as e:
-                self._update_status_text(f"Error loading history: {e}", "error")
-            self.pop_screen()
+        def on_selected(path: Path | None) -> None:
+            if path:
+                try:
+                    loaded = _load_history(path)
+                    self.history = _truncate_history(loaded, MAX_HISTORY)
+                    self._save_history()
+                    self._refresh_chat_display()
+                    self._refresh_context_stats()
+                    self._update_status_text(
+                        f"Loaded {len(loaded)} messages", "success"
+                    )
+                except Exception as e:
+                    self._update_status_text(f"Error loading history: {e}", "error")
 
-        picker = FileOpen(filters=Filters([("JSONL", [".jsonl"])]), must_exist=True)
-        picker.on_file_selected = on_selected
-        self.push_screen(picker)
+        picker = FileOpen(
+            filters=Filters(("JSONL", lambda p: p.suffix.lower() == ".jsonl")),
+            must_exist=True,
+        )
+        self.push_screen(picker, callback=on_selected)
 
     def action_send(self) -> None:
         if self.is_loading:
@@ -434,17 +490,30 @@ class Yap(App):
         payload = _build_payload(model, self.history, system_prompt or None)
 
         def make_request():
+            start_time = time.time()
             try:
                 data = _http_chat(API_URL, payload, TIMEOUT)
-                content = _parse_response(data)
+                message = _parse_response(data)
 
                 with self._history_lock:
-                    self.history.append({"role": "assistant", "content": content})
+                    self.history.append(message)
                     self.history = _truncate_history(self.history, MAX_HISTORY)
 
-                _safe_write(LAST_RESPONSE_FILE, content)
+                # Save raw response or just content to last_response.md
+                last_content = message.get("content") or ""
+                if not last_content and message.get("tool_calls"):
+                    last_content = json.dumps(message.get("tool_calls"), indent=2)
+
+                _safe_write(LAST_RESPONSE_FILE, last_content)
                 self._save_history()
-                self.update_status("Response saved to last_response.md", "success")
+
+                elapsed = time.time() - start_time
+                finish_reason = data.get("choices", [{}])[0].get(
+                    "finish_reason", "unknown"
+                )
+                self.update_status(
+                    f"Success ({elapsed:.1f}s) | Finish: {finish_reason}", "success"
+                )
             except Exception as e:
                 self.update_status(f"Error: {str(e)[:100]}", "error")
             finally:
@@ -468,7 +537,8 @@ class Yap(App):
         self.query_one("#user-input", ChatInput).text = ""
         self._update_status_text("Input Cleared")
 
-    def action_quit(self) -> None:
+    async def action_quit(self) -> None:
+        """Quit the application."""
         self.exit()
 
     def _refresh_chat_display(self) -> None:

@@ -17,7 +17,7 @@ uv.lock           # uv lockfile
 requirements.txt  # pip-compatible requirements (exported from uv)
 flake.nix         # Nix build & dev shell
 bin/update        # Update deps script
-tests/            # Tests
+tests/            # Tests (test_pure.py, test_loading.py)
 .venv/            # uv virtualenv (gitignored)
 *.jsonl *.md      # Generated: chat history, last response
 ```
@@ -76,7 +76,7 @@ All via environment variables. No config files.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CHAT_CURL_API_URL` | `http://lattice:8089/v1/chat/completions` | LLM endpoint |
-| `CHAT_CURL_TIMEOUT` | `600` | Request timeout in seconds (10 min for heavy tool use) |
+| `CHAT_CURL_TIMEOUT` | `3600` | Request timeout in seconds (1 hr for heavy tool use) |
 | `CHAT_CURL_HISTORY_FILE` | `chat_history.jsonl` | Chat history path |
 | `CHAT_CURL_LAST_RESPONSE_FILE` | `last_response.md` | Last response output |
 | `CHAT_CURL_MAX_HISTORY` | `50` | Max messages to keep |
