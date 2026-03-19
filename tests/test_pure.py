@@ -71,6 +71,9 @@ def test_config_defaults():
     assert MAX_PUSH_ITERATIONS == 10
     assert "[CONTINUE]" in NUDGE_MESSAGE
     assert "yap__done" in NUDGE_MESSAGE
+    assert "system state" in NUDGE_MESSAGE.lower()
+    assert "immediate inspection" in NUDGE_MESSAGE.lower()
+    assert "VERIFIED" in NUDGE_MESSAGE
 
 
 def test_estimate_tokens():

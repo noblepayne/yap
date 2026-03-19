@@ -46,12 +46,11 @@ MAX_HISTORY = int(os.environ.get("YAP_MAX_HISTORY", 50))
 MAX_PUSH_ITERATIONS = int(os.environ.get("YAP_MAX_PUSH_ITERATIONS", 10))
 NUDGE_MESSAGE = (
     "[CONTINUE]\n"
-    "Take a fresh snapshot RIGHT NOW before doing anything else. \n"
-    "Do not reason from memory.\n\n"
+    "Refresh your view of the system state RIGHT NOW. Do not reason from memory.\n\n"
     "Then answer explicitly:\n"
-    "1. What page are you on, and what does it actually show?\n"
-    "2. What have you VERIFIED from fresh observations vs. assumed?\n"
-    "3. What is the next concrete action you will take?\n\n"
+    "1. Based on immediate inspection, what is the exact status of the task environment?\n"
+    "2. What have you VERIFIED through fresh observations vs. what are you still assuming?\n"
+    "3. What is the next concrete action you will take to move the task forward?\n\n"
     "Then do it. Keep working until the task is genuinely complete.\n"
     "If truly stuck, call yap__done and explain exactly why."
 )
@@ -243,6 +242,46 @@ def _format_chat_display(history: list) -> str:
             formatted.append(f"[{role}]\n{display_content}\n" + ("-" * 40))
 
     return "\n\n".join(formatted)
+
+
+# TODO: Future enhancement - Rich Reasoning Display
+# -------------------------------------------------
+# Current implementation shows reasoning as plain "THOUGHTS:" prefix.
+# For better visibility and separation, consider:
+#
+# 1. Parsing Strategies:
+#    - Check for dedicated fields: message.get("reasoning") or message.get("reasoning_content")
+#    - Parse XML-style tags from content: <thought>...</thought> or <reasoning>...</reasoning>
+#    - Handle both simultaneously (tags take precedence if both exist)
+#
+# 2. Visual Presentation Options:
+#    - Use Textual markup for styling: [dim]...[/dim] or [italic]...[/italic]
+#    - Create collapsible sections with headers (requires custom widget)
+#    - Use ASCII art boxes or borders to separate reasoning from main content
+#    - Examples:
+#        ╭─ Reasoning ────────────────────────
+#        │ I need to check the file contents...
+#        ╰───────────────────────────────────
+#        [DIM]Reasoning: I will first list the directory[/DIM]
+#
+# 3. Layout Considerations:
+#    - Default to showing reasoning? Or make it user-toggleable?
+#    - Should reasoning appear above or below the main assistant message?
+#    - How to handle very long reasoning (scrolling, truncation)?
+#
+# 4. Implementation Approach:
+#    - Modify _parse_response to extract reasoning into a standardized field
+#    - Update _format_chat_display to apply styling and layout
+#    - Consider adding a toggle in settings or via keyboard shortcut
+#
+# 5. Epistemological Note:
+#    This display should reinforce the push mode nudge: the model must
+#    verify state through action, not just reason internally. Seeing
+#    the reasoning helps users audit whether the model is grounding
+#    its actions in observed facts.
+#
+# For now, the basic "THOUGHTS:" prefix maintains backward compatibility
+# while providing minimal transparency into the model's process.
 
 
 def _estimate_tokens(text: str) -> int:
