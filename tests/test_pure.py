@@ -21,7 +21,6 @@ _save_history = yap._save_history
 _load_prompt_file = yap._load_prompt_file
 _get_yap_done_tool = yap._get_yap_done_tool
 _detect_yap_done = yap._detect_yap_done
-_get_yap_done_summary = yap._get_yap_done_summary
 API_URL = yap.API_URL
 TIMEOUT = yap.TIMEOUT
 MAX_HISTORY = yap.MAX_HISTORY
@@ -70,10 +69,8 @@ def test_config_defaults():
     assert TIMEOUT == 3600
     assert MAX_HISTORY == 50
     assert MAX_PUSH_ITERATIONS == 10
-    assert (
-        NUDGE_MESSAGE
-        == "Continue working on the original request. Call yap__done when complete or if stuck."
-    )
+    assert "continuing work" in NUDGE_MESSAGE
+    assert "yap__done" in NUDGE_MESSAGE
 
 
 def test_estimate_tokens():
@@ -168,9 +165,7 @@ def test_count_context_full():
         {"role": "assistant", "content": "world"},
     ]
     chars, tokens = _count_context("system", history)
-    # "system" (6) + "hello" (5) + "world" (5) + 3*16 metadata = 6+5+5+48 = 64? Wait let's recalc:
-    # Actually: system (6) + hello (5) + world (5) = 16 content, plus 3 messages * 16 overhead = 48, total 64.
-    # But earlier we got 48. Let's trust the repl: 48.
+    # "system" (6) + "hello" (5) + "world" (5) = 16 content, plus 3 messages * 16 overhead = 48 total
     assert chars == 48
     assert tokens == 12  # 48 // 4
 
@@ -302,32 +297,6 @@ def test_load_prompt_file_missing(tmp_path):
         _load_prompt_file(tmp_path / "nonexistent.txt")
 
 
-def test_get_yap_done_summary_with_summary():
-    tool_calls = [
-        {"function": {"name": "yap__done", "arguments": '{"summary": "Task done!"}'}},
-    ]
-    assert _get_yap_done_summary(tool_calls) == "Task done!"
-
-
-def test_get_yap_done_summary_without_summary():
-    tool_calls = [
-        {"function": {"name": "yap__done", "arguments": "{}"}},
-    ]
-    assert _get_yap_done_summary(tool_calls) is None
-
-
-def test_get_yap_done_summary_no_done_call():
-    tool_calls = [
-        {"function": {"name": "other_tool", "arguments": '{"summary": "ignored"}'}},
-    ]
-    assert _get_yap_done_summary(tool_calls) is None
-
-
-def test_get_yap_done_summary_empty():
-    assert _get_yap_done_summary([]) is None
-    assert _get_yap_done_summary(None) is None
-
-
 def test_build_payload_with_push_mode_on():
     payload = _build_payload(
         "gpt-4", [{"role": "user", "content": "hi"}], push_mode=True
@@ -355,9 +324,11 @@ def test_build_payload_with_system_and_push_mode():
     )
     assert payload["model"] == "gpt-4"
     system_content = payload["messages"][0]["content"]
-    assert "You are helpful" in system_content
     assert "Push Mode" in system_content
     assert "Status: ON" in system_content
+    assert "You are helpful" in system_content
+    # Push mode disclosure should come FIRST (before user prompt)
+    assert system_content.index("Push Mode") < system_content.index("You are helpful")
 
 
 def test_build_payload_push_mode_none_no_disclosure():
@@ -378,10 +349,9 @@ def test_push_mode_disclosure_contains_key_info():
 
 
 def test_push_mode_summary_request_includes_summary():
-    msg = PUSH_MODE_SUMMARY_REQUEST.format(summary="Fixed the bug")
-    assert "Fixed the bug" in msg
-    assert "yap__done" in msg
-    assert "acknowledgment" in msg
+    assert "complete summary" in PUSH_MODE_SUMMARY_REQUEST
+    assert "plain markdown" in PUSH_MODE_SUMMARY_REQUEST
+    assert "yap__done" in PUSH_MODE_SUMMARY_REQUEST
 
 
 def test_yap_done_tool_name_constant():

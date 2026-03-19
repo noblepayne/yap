@@ -121,9 +121,9 @@ Run: `pytest tests/`
 
 ## Key Files to Know
 
-- `yap.py:30-36` - Configuration (env vars)
-- `yap.py:250-320` - The HTTP request logic (where TIMEOUT matters)
-- `yap.py:86+` - Main App class
+- `yap.py:41-46` - Configuration (env vars)
+- `yap.py:279-330` - The HTTP request logic (where TIMEOUT matters)
+- `yap.py:373+` - Main App class
 
 ---
 

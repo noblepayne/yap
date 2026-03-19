@@ -44,7 +44,11 @@ HISTORY_FILE = Path(os.environ.get("YAP_HISTORY_FILE", "chat_history.jsonl"))
 LAST_RESPONSE_FILE = Path(os.environ.get("YAP_LAST_RESPONSE_FILE", "last_response.md"))
 MAX_HISTORY = int(os.environ.get("YAP_MAX_HISTORY", 50))
 MAX_PUSH_ITERATIONS = int(os.environ.get("YAP_MAX_PUSH_ITERATIONS", 10))
-NUDGE_MESSAGE = "Continue working on the original request. Call yap__done when complete or if stuck."
+NUDGE_MESSAGE = (
+    "You are continuing work on the original request. Review what has been done "
+    "so far and continue. If the task is truly complete or you are stuck with no "
+    "path forward, call yap__done to exit this loop."
+)
 
 YAP_DONE_TOOL_NAME = "yap__done"
 
@@ -55,7 +59,11 @@ signal completion. After yap__done, you receive one final clean response
 round (no tools).
 Status: {status}"""
 
-PUSH_MODE_SUMMARY_REQUEST = 'Task marked complete via yap__done. Summary: "{summary}"\nProvide a brief conversational acknowledgment of the completion.'
+PUSH_MODE_SUMMARY_REQUEST = (
+    "Task marked complete via yap__done. Provide a complete summary in plain "
+    "markdown of what was accomplished, any issues encountered, and the final "
+    "state. Be thorough but concise."
+)
 
 logging.basicConfig(
     level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -103,11 +111,11 @@ def _build_payload(
 ) -> dict:
     """Build request payload."""
     parts = []
-    if system_prompt:
-        parts.append(system_prompt)
     if push_mode is not None:
         status = "ON" if push_mode else "OFF"
         parts.append(PUSH_MODE_DISCLOSURE.format(status=status))
+    if system_prompt:
+        parts.append(system_prompt)
     if parts:
         system = "\n\n".join(parts)
         payload_messages = [{"role": "system", "content": system}]
@@ -148,22 +156,6 @@ def _detect_yap_done(tool_calls: list[dict] | None) -> bool:
     return any(
         tc.get("function", {}).get("name") == YAP_DONE_TOOL_NAME for tc in tool_calls
     )
-
-
-def _get_yap_done_summary(tool_calls: list[dict] | None) -> str | None:
-    """Extract summary from yap__done tool call."""
-    if not tool_calls:
-        return None
-    for tc in tool_calls:
-        func = tc.get("function", {})
-        if func.get("name") == YAP_DONE_TOOL_NAME:
-            args_str = func.get("arguments") or "{}"
-            try:
-                args = json.loads(args_str)
-                return args.get("summary")
-            except (json.JSONDecodeError, TypeError):
-                return None
-    return None
 
 
 def _parse_response(data: dict) -> dict:
@@ -719,16 +711,14 @@ class Yap(App):
                     has_done_call = _detect_yap_done(tool_calls)
 
                     if has_done_call:
-                        summary = _get_yap_done_summary(tool_calls) or "task completed"
                         self.update_status(
                             f"[PUSH DONE] {iteration + 1} iteration(s) - final round ({elapsed:.1f}s)",
                             "normal",
                         )
 
-                        summary_msg = PUSH_MODE_SUMMARY_REQUEST.format(summary=summary)
                         with self._history_lock:
                             self.history.append(
-                                {"role": "user", "content": summary_msg}
+                                {"role": "user", "content": PUSH_MODE_SUMMARY_REQUEST}
                             )
                             self.history = _truncate_history(self.history, MAX_HISTORY)
                         self._save_history()
