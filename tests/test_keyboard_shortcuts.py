@@ -48,6 +48,7 @@ def test_toggle_push_in_bindings():
         for b in Yap.BINDINGS
     ]
     assert ("ctrl+p", "toggle_push") in keys_and_actions
+    assert ("ctrl+m", "toggle_debug") in keys_and_actions
 
 
 def test_toggle_push_method_callable():

@@ -5,10 +5,16 @@ All notable changes to yap will be documented here.
 ## [Unreleased]
 
 ### Added
-- **Push mode disclosure** - System prompt now explains push mode mechanism and current status (ON/OFF)
-- **Final round after yap__done** - One clean response round (no tools) after push mode completion for summary
-- **Ctrl+Enter to send** - Works even when focused in input field
-- **Ctrl+P to toggle push mode** - Keyboard shortcut for enabling/disabling push mode
+- **Symmetric History Synchronization (v2)** - High-fidelity history ingestion via a signed footer protocol.
+- **HMAC-SHA256 Verification** - Secure footer validation to prevent history spoofing.
+- **Native Reasoning Support** - Supports Anthropic-style thinking blocks with sequential rendering and visual styling.
+- **Outbound History Stripping** - Automatically omits thinking blocks when switching to incompatible providers.
+- **Stable Session Identity** - Session IDs derived from history file hashes to enable kernel-side re-hydration.
+- **Expert Debug View (Ctrl+M)** - Real-time stats on footer size, spliced turns, and session metadata.
+- **Push mode disclosure** - System prompt explains push mode mechanism and current status (ON/OFF).
+- **Final round after yap__done** - One clean response round (no tools) for final summary.
+- **Ctrl+Enter to send** - Works even when focused in input field.
+- **Ctrl+P to toggle push mode** - Keyboard shortcut for enabling/disabling push mode.
 
 ### Fixed
 - **Type handling in yap__done summary extraction** - Now handles missing/null arguments gracefully

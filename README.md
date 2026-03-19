@@ -75,6 +75,8 @@ Environment variables. That's it.
 | `YAP_LAST_RESPONSE_FILE` | `last_response.md` | Last response output |
 | `YAP_MAX_HISTORY` | `50` | Messages to keep |
 | `YAP_MAX_PUSH_ITERATIONS` | `10` | Max iterations in push mode |
+| `INJECTOR_HMAC_SECRET` | None | Secret for history sync verification |
+| `YAP_PROVIDER` | `anthropic` | Backend provider for history stripping |
 
 ### Updating Dependencies
 
@@ -90,6 +92,7 @@ This updates `uv.lock`, `requirements.txt`, and the Nix FOD hash.
 - `Ctrl+Enter` - Send message (works in input)
 - `Ctrl+S` - Send message
 - `Ctrl+P` - Toggle push mode
+- `Ctrl+M` - Toggle metadata debug view
 - `Ctrl+L` - Clear history
 - `Ctrl+U` - Clear input
 - `Escape` - Cancel push loop (when active)

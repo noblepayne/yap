@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -171,6 +172,76 @@ def test_count_context_full():
     # "system" (6) + "hello" (5) + "world" (5) = 16 content, plus 3 messages * 16 overhead = 48 total
     assert chars == 48
     assert tokens == 12  # 48 // 4
+
+
+def test_derive_session_id():
+    import os
+
+    path1 = "chat_history.jsonl"
+    path2 = "./chat_history.jsonl"
+    id1 = yap.derive_session_id(path1)
+    id2 = yap.derive_session_id(path2)
+    assert id1 == id2
+    assert len(id1) == 16
+
+    abs_path = os.path.abspath(path1)
+    id3 = yap.derive_session_id(abs_path)
+    assert id1 == id3
+
+
+def test_unify_message():
+    # String content + thought field
+    msg = {"role": "assistant", "content": "hi", "thought": "thinking"}
+    unified = yap._unify_message(msg)
+    assert unified["content"] == [
+        {"type": "thinking", "thinking": "thinking"},
+        {"type": "text", "text": "hi"},
+    ]
+
+    # Block content + reasoning_content
+    msg = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "hi"}],
+        "reasoning_content": "thinking",
+    }
+    unified = yap._unify_message(msg)
+    assert unified["content"] == [
+        {"type": "thinking", "thinking": "thinking"},
+        {"type": "text", "text": "hi"},
+    ]
+
+
+def test_extract_thoughts_blocks():
+    blocks = [
+        {"type": "thinking", "thinking": "I should say hello"},
+        {"type": "text", "text": "Hello world"},
+    ]
+    thoughts, text = yap._extract_thoughts(blocks)
+    assert thoughts == ["I should say hello"]
+    assert text == "Hello world"
+
+
+def test_extract_thoughts_string():
+    content = "Hello world"
+    thoughts, text = yap._extract_thoughts(content)
+    assert thoughts == []
+    assert text == "Hello world"
+
+
+def test_format_chat_display_with_thoughts():
+    history = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "plan"},
+                {"type": "text", "text": "result"},
+            ],
+        }
+    ]
+    display = yap._format_chat_display(history)
+    assert "▶ Reasoning" in display
+    assert "plan" in display
+    assert "result" in display
 
 
 def test_truncate_history():
@@ -355,6 +426,66 @@ def test_push_mode_summary_request_includes_summary():
     assert "complete summary" in PUSH_MODE_SUMMARY_REQUEST
     assert "plain markdown" in PUSH_MODE_SUMMARY_REQUEST
     assert "yap__done" in PUSH_MODE_SUMMARY_REQUEST
+
+
+def test_prepare_history_for_request_strips_thinking():
+    history = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "thought1"},
+                {"type": "text", "text": "text1"},
+            ],
+            "_meta": {"provider": "anthropic"},
+        }
+    ]
+    # Same provider
+    projected = yap._prepare_history_for_request(history, "anthropic")
+    assert projected[0]["content"][0]["type"] == "thinking"
+    assert "_meta" not in projected[0]
+
+    # Different provider
+    projected = yap._prepare_history_for_request(history, "openai")
+    assert projected[0]["content"][0]["type"] == "text"
+    assert "omitted" in projected[0]["content"][0]["text"]
+    assert "_meta" not in projected[0]
+
+
+def test_parse_footer_valid():
+    import base64
+    import hmac
+    import hashlib
+    import os
+
+    secret = "test-secret"
+    os.environ["INJECTOR_HMAC_SECRET"] = secret
+
+    data = json.dumps(
+        {
+            "turns": [
+                {"role": "assistant", "content": [{"type": "text", "text": "sub-turn"}]}
+            ]
+        }
+    )
+    hmac_val = hmac.new(secret.encode(), data.encode(), hashlib.sha256).hexdigest()
+    envelope = json.dumps({"data": data, "hmac": hmac_val})
+    b64_envelope = base64.b64encode(envelope.encode()).decode()
+
+    text = f"Final answer\n\n<!-- x-injector-v1\n{b64_envelope}\n-->"
+    payload, clean_text = yap._parse_footer(text)
+
+    assert clean_text == "Final answer"
+    assert payload["turns"][0]["role"] == "assistant"
+
+
+def test_validate_turns_rejects_user():
+    turns = [
+        {"role": "user", "content": [{"type": "text", "text": "hack"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+    ]
+    validated = yap._validate_turns(turns)
+    assert len(validated) == 1
+    assert validated[0]["role"] == "assistant"
 
 
 def test_yap_done_tool_name_constant():
