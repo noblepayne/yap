@@ -334,7 +334,8 @@ def test_push_mode_error_handling(mock_llm_server):
         )
         data = yap._http_chat(yap.API_URL, payload, 5)
         message = yap._parse_response(data)
-        assert message.get("content") == "First response"
+        # Content is unified into blocks
+        assert message["content"][0]["text"] == "First response"
 
         # Add nudge
         history.append(message)
