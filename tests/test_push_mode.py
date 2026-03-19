@@ -154,6 +154,11 @@ class MockLLMHandler(BaseHTTPRequestHandler):
                 self.send_response(500)
                 self.end_headers()
                 return None
+        elif scenario == "always_502":
+            # Always return 502 to trigger retry backoff
+            self.send_response(502)
+            self.end_headers()
+            return None
         else:
             # Default: call yap__done
             return {
@@ -401,3 +406,41 @@ def test_push_mode_detect_yap_done():
 
     # Test with None
     assert yap._detect_yap_done(None) is False
+
+
+def test_cancel_during_retry_backoff(mock_llm_server):
+    """Regression: cancel during tenacity retry backoff must unblock immediately."""
+    import requests
+
+    server, port = mock_llm_server
+    server.scenario = "always_502"
+
+    original_url = yap.API_URL
+    yap.API_URL = f"http://localhost:{port}/v1/chat/completions"
+
+    try:
+        cancel_event = threading.Event()
+        session = requests.Session()
+        payload = yap._build_payload("test-model", [{"role": "user", "content": "hi"}])
+
+        # Cancel after the first 502 triggers tenacity backoff
+        def cancel_after_first_failure():
+            time.sleep(0.3)
+            cancel_event.set()
+            session.close()
+
+        cancel_thread = threading.Thread(target=cancel_after_first_failure)
+        cancel_thread.start()
+
+        start = time.time()
+        with pytest.raises(Exception):
+            yap._http_chat(yap.API_URL, payload, 5, session, cancel_event)
+        elapsed = time.time() - start
+
+        cancel_thread.join()
+
+        # Must finish in under 1s — tenacity's min backoff is 2s,
+        # so if cancel didn't interrupt the sleep this would take 2s+
+        assert elapsed < 1.0, f"Cancel took {elapsed:.1f}s, should be <1s"
+    finally:
+        yap.API_URL = original_url

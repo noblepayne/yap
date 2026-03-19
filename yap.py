@@ -245,25 +245,45 @@ def _count_context(system_prompt: str, history: list) -> tuple[int, int]:
 # === SIDE EFFECTS ===
 
 
-def _http_chat(url: str, payload: dict, timeout: int) -> dict:
+def _http_chat(
+    url: str,
+    payload: dict,
+    timeout: int,
+    session: requests.Session | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict:
     """Make HTTP POST to LLM endpoint with retries."""
+    s = session or requests.Session()
 
-    @retry(
-        retry=retry_if_exception_type(
+    def _should_retry(retry_state):
+        if cancel_event and cancel_event.is_set():
+            return False
+        return retry_if_exception_type(
             (
                 requests.exceptions.RequestException,
                 requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout,
                 requests.exceptions.ChunkedEncodingError,
             )
-        ),
+        )(retry_state)
+
+    def _cancel_sleep(seconds: float) -> None:
+        """Sleep that can be interrupted by cancel_event."""
+        if cancel_event:
+            cancel_event.wait(timeout=seconds)
+        else:
+            time.sleep(seconds)
+
+    @retry(
+        retry=_should_retry,
         wait=wait_exponential(multiplier=1, min=2, max=10),
         stop=stop_after_attempt(5),
         before_sleep=before_sleep_log(logging.getLogger("yap"), logging.WARNING),
         reraise=True,
+        sleep=_cancel_sleep,
     )
     def _do_post():
-        r = requests.post(url, json=payload, timeout=timeout)
+        r = s.post(url, json=payload, timeout=timeout)
         # Retry on 5xx server errors
         if 500 <= r.status_code < 600:
             r.raise_for_status()
@@ -400,6 +420,8 @@ class Yap(App):
         self.history = []
         self._history_lock = threading.Lock()
         self._push_cancelled = threading.Event()
+        self._http_session: requests.Session | None = None
+        self._http_session_lock = threading.Lock()
         self._load_history()
 
     def compose(self) -> ComposeResult:
@@ -589,11 +611,24 @@ class Yap(App):
         push_mode_local = self.push_mode
         tools = [_get_yap_done_tool()] if push_mode_local else None
 
+        # Create an HTTP session we can close to cancel in-flight requests
+        session = requests.Session()
+        with self._http_session_lock:
+            self._http_session = session
+
         def make_request():
             start_time = time.time()
             iteration = 0
             try:
                 while True:
+                    # Check for cancellation before starting next request
+                    if self._push_cancelled.is_set():
+                        self.update_status(
+                            f"[CANCELLED] {iteration} iteration(s) ({time.time() - start_time:.1f}s)",
+                            "normal",
+                        )
+                        break
+
                     # Build payload for current iteration
                     with self._history_lock:
                         current_history = self.history.copy()
@@ -609,7 +644,7 @@ class Yap(App):
                         )
 
                     # Make request
-                    data = _http_chat(API_URL, payload, TIMEOUT)
+                    data = _http_chat(API_URL, payload, TIMEOUT, session, self._push_cancelled)
                     message = _parse_response(data)
 
                     with self._history_lock:
@@ -680,6 +715,9 @@ class Yap(App):
             except Exception as e:
                 self.update_status(f"Error: {str(e)[:100]}", "error")
             finally:
+                with self._http_session_lock:
+                    self._http_session = None
+                session.close()
                 self.call_from_thread(setattr, self, "is_loading", False)
                 self.call_from_thread(self._refresh_chat_display)
                 self.call_from_thread(self._refresh_context_stats)
@@ -701,10 +739,13 @@ class Yap(App):
         self._update_status_text("Input Cleared")
 
     def action_cancel_push(self) -> None:
-        """Cancel the push loop if active."""
-        if self.is_loading and self.push_mode:
+        """Cancel any in-flight request (push or single)."""
+        if self.is_loading:
             self._push_cancelled.set()
-            self._update_status_text("Push cancelled", "normal")
+            with self._http_session_lock:
+                if self._http_session:
+                    self._http_session.close()
+            self._update_status_text("Cancelled", "normal")
 
     async def action_quit(self) -> None:
         """Quit the application."""
