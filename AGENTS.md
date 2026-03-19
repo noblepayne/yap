@@ -4,7 +4,7 @@
 
 Simple. Works. No drama.
 
-A lightweight TUI for testing LLM endpoints and proxies. Built for debugging proxies like [mcp-injector](https://github.com/noblepayne/mcp-injector). Not competing with opencode - this is simpler, easier to modify, focused purely on request/response. No agent loop. No tools.
+A lightweight TUI for testing LLM endpoints and proxies. Built for debugging proxies like [mcp-injector](https://github.com/noblepayne/mcp-injector). Not competing with opencode - this is simpler, easier to modify, focused purely on request/response. Has optional push mode for multi-step tasks.
 
 ---
 
@@ -75,11 +75,12 @@ All via environment variables. No config files.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CHAT_CURL_API_URL` | `http://lattice:8089/v1/chat/completions` | LLM endpoint |
-| `CHAT_CURL_TIMEOUT` | `3600` | Request timeout in seconds (1 hr for heavy tool use) |
-| `CHAT_CURL_HISTORY_FILE` | `chat_history.jsonl` | Chat history path |
-| `CHAT_CURL_LAST_RESPONSE_FILE` | `last_response.md` | Last response output |
-| `CHAT_CURL_MAX_HISTORY` | `50` | Max messages to keep |
+| `YAP_API_URL` | `http://lattice:8089/v1/chat/completions` | LLM endpoint |
+| `YAP_TIMEOUT` | `3600` | Request timeout in seconds (1 hr for heavy tool use) |
+| `YAP_HISTORY_FILE` | `chat_history.jsonl` | Chat history path |
+| `YAP_LAST_RESPONSE_FILE` | `last_response.md` | Last response output |
+| `YAP_MAX_HISTORY` | `50` | Max messages to keep |
+| `YAP_MAX_PUSH_ITERATIONS` | `10` | Max iterations in push mode |
 
 ---
 

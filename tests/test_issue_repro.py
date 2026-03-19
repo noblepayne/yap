@@ -1,8 +1,6 @@
-
 import sys
 from pathlib import Path
 import importlib.util
-import json
 
 root = Path(__file__).parent.parent
 sys.path.insert(0, str(root))
@@ -12,6 +10,7 @@ yap = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(yap)
 
 _count_context = yap._count_context
+
 
 def test_count_context_none_content_crash():
     """Reproduce the crash when content is None (assistant message with tool calls)."""
@@ -23,9 +22,9 @@ def test_count_context_none_content_crash():
                 {
                     "id": "call_123",
                     "type": "function",
-                    "function": {"name": "test_tool", "arguments": "{}"}
+                    "function": {"name": "test_tool", "arguments": "{}"},
                 }
-            ]
+            ],
         }
     ]
     # This should NOT crash
