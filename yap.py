@@ -23,6 +23,7 @@ from tenacity import (
 )
 from textual import on
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import (
@@ -44,6 +45,17 @@ LAST_RESPONSE_FILE = Path(os.environ.get("YAP_LAST_RESPONSE_FILE", "last_respons
 MAX_HISTORY = int(os.environ.get("YAP_MAX_HISTORY", 50))
 MAX_PUSH_ITERATIONS = int(os.environ.get("YAP_MAX_PUSH_ITERATIONS", 10))
 NUDGE_MESSAGE = "Continue working on the original request. Call yap__done when complete or if stuck."
+
+YAP_DONE_TOOL_NAME = "yap__done"
+
+PUSH_MODE_DISCLOSURE = """## Push Mode
+After your response, if yap__done() was not called, your response will be 
+re-submitted to you with a nudge to continue. Call yap__done(summary) to 
+signal completion. After yap__done, you receive one final clean response 
+round (no tools).
+Status: {status}"""
+
+PUSH_MODE_SUMMARY_REQUEST = 'Task marked complete via yap__done. Summary: "{summary}"\nProvide a brief conversational acknowledgment of the completion.'
 
 logging.basicConfig(
     level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -87,11 +99,20 @@ def _build_payload(
     messages: list,
     system_prompt: str | None = None,
     tools: list | None = None,
+    push_mode: bool | None = None,
 ) -> dict:
     """Build request payload."""
-    payload_messages = []
+    parts = []
     if system_prompt:
-        payload_messages.append({"role": "system", "content": system_prompt})
+        parts.append(system_prompt)
+    if push_mode is not None:
+        status = "ON" if push_mode else "OFF"
+        parts.append(PUSH_MODE_DISCLOSURE.format(status=status))
+    if parts:
+        system = "\n\n".join(parts)
+        payload_messages = [{"role": "system", "content": system}]
+    else:
+        payload_messages = []
     payload_messages.extend(messages)
     payload = {"model": model, "messages": payload_messages}
     if tools is not None:
@@ -104,7 +125,7 @@ def _get_yap_done_tool() -> dict:
     return {
         "type": "function",
         "function": {
-            "name": "yap__done",
+            "name": YAP_DONE_TOOL_NAME,
             "description": "Call this when you have completed the task and no further tool calls or reasoning are required.",
             "parameters": {
                 "type": "object",
@@ -124,7 +145,25 @@ def _detect_yap_done(tool_calls: list[dict] | None) -> bool:
     """Detect if yap__done tool was called."""
     if not tool_calls:
         return False
-    return any(tc.get("function", {}).get("name") == "yap__done" for tc in tool_calls)
+    return any(
+        tc.get("function", {}).get("name") == YAP_DONE_TOOL_NAME for tc in tool_calls
+    )
+
+
+def _get_yap_done_summary(tool_calls: list[dict] | None) -> str | None:
+    """Extract summary from yap__done tool call."""
+    if not tool_calls:
+        return None
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        if func.get("name") == YAP_DONE_TOOL_NAME:
+            args_str = func.get("arguments") or "{}"
+            try:
+                args = json.loads(args_str)
+                return args.get("summary")
+            except (json.JSONDecodeError, TypeError):
+                return None
+    return None
 
 
 def _parse_response(data: dict) -> dict:
@@ -322,6 +361,10 @@ def _load_prompt_file(path: Path) -> str:
 class ChatInput(TextArea):
     """Custom input widget that handles send keys locally."""
 
+    BINDINGS = [
+        Binding("ctrl+enter", "send", "Send", priority=True),
+    ]
+
     def action_send(self) -> None:
         if self.text.strip():
             self.app.action_send()
@@ -408,6 +451,7 @@ class Yap(App):
         ("ctrl+s", "send", "Send"),
         ("ctrl+l", "clear_history", "Clear History"),
         ("ctrl+u", "clear_input", "Clear Input"),
+        ("ctrl+p", "toggle_push", "Toggle Push"),
         ("q", "quit", "Quit"),
         ("escape", "cancel_push", "Cancel Push"),
     ]
@@ -491,16 +535,7 @@ class Yap(App):
 
     @on(Button.Pressed, "#push-mode-toggle")
     def _on_push_mode_toggle(self, event: Button.Pressed) -> None:
-        self.push_mode = not self.push_mode
-        button = self.query_one("#push-mode-toggle", Button)
-        if self.push_mode:
-            button.label = "Push Mode: On"
-            button.variant = "success"
-            self._update_status_text("Push Mode enabled", "success")
-        else:
-            button.label = "Push Mode: Off"
-            button.variant = "default"
-            self._update_status_text("Push Mode disabled", "normal")
+        self.action_toggle_push()
 
     def watch_is_loading(self, loading: bool) -> None:
         status = self.query_one("#status", Static)
@@ -633,7 +668,11 @@ class Yap(App):
                     with self._history_lock:
                         current_history = self.history.copy()
                     payload = _build_payload(
-                        model, current_history, system_prompt or None, tools
+                        model,
+                        current_history,
+                        system_prompt or None,
+                        tools,
+                        push_mode_local,
                     )
 
                     # Update status for push mode
@@ -644,7 +683,9 @@ class Yap(App):
                         )
 
                     # Make request
-                    data = _http_chat(API_URL, payload, TIMEOUT, session, self._push_cancelled)
+                    data = _http_chat(
+                        API_URL, payload, TIMEOUT, session, self._push_cancelled
+                    )
                     message = _parse_response(data)
 
                     with self._history_lock:
@@ -678,9 +719,50 @@ class Yap(App):
                     has_done_call = _detect_yap_done(tool_calls)
 
                     if has_done_call:
-                        # Done!
+                        summary = _get_yap_done_summary(tool_calls) or "task completed"
                         self.update_status(
-                            f"[PUSH DONE] {iteration + 1} iteration(s) ({elapsed:.1f}s)",
+                            f"[PUSH DONE] {iteration + 1} iteration(s) - final round ({elapsed:.1f}s)",
+                            "normal",
+                        )
+
+                        summary_msg = PUSH_MODE_SUMMARY_REQUEST.format(summary=summary)
+                        with self._history_lock:
+                            self.history.append(
+                                {"role": "user", "content": summary_msg}
+                            )
+                            self.history = _truncate_history(self.history, MAX_HISTORY)
+                        self._save_history()
+                        self.call_from_thread(self._refresh_chat_display)
+
+                        with self._history_lock:
+                            current_history = self.history.copy()
+                        final_payload = _build_payload(
+                            model, current_history, system_prompt or None, None, None
+                        )
+                        self.update_status(
+                            "[PUSH DONE] Final summary round...",
+                            "normal",
+                        )
+                        final_data = _http_chat(
+                            API_URL,
+                            final_payload,
+                            TIMEOUT,
+                            session,
+                            self._push_cancelled,
+                        )
+                        final_message = _parse_response(final_data)
+
+                        with self._history_lock:
+                            self.history.append(final_message)
+                            self.history = _truncate_history(self.history, MAX_HISTORY)
+
+                        final_content = final_message.get("content") or ""
+                        _safe_write(LAST_RESPONSE_FILE, final_content)
+                        self._save_history()
+
+                        final_elapsed = time.time() - start_time
+                        self.update_status(
+                            f"[PUSH DONE] {iteration + 1} iteration(s) ({final_elapsed:.1f}s)",
                             "success",
                         )
                         break
@@ -737,6 +819,19 @@ class Yap(App):
     def action_clear_input(self) -> None:
         self.query_one("#user-input", ChatInput).text = ""
         self._update_status_text("Input Cleared")
+
+    def action_toggle_push(self) -> None:
+        """Toggle push mode on/off and update UI."""
+        self.push_mode = not self.push_mode
+        button = self.query_one("#push-mode-toggle", Button)
+        if self.push_mode:
+            button.label = "Push Mode: On"
+            button.variant = "success"
+            self._update_status_text("Push Mode enabled", "success")
+        else:
+            button.label = "Push Mode: Off"
+            button.variant = "default"
+            self._update_status_text("Push Mode disabled", "normal")
 
     def action_cancel_push(self) -> None:
         """Cancel any in-flight request (push or single)."""

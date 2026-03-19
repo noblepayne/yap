@@ -87,7 +87,9 @@ This updates `uv.lock`, `requirements.txt`, and the Nix FOD hash.
 
 ## Keys
 
+- `Ctrl+Enter` - Send message (works in input)
 - `Ctrl+S` - Send message
+- `Ctrl+P` - Toggle push mode
 - `Ctrl+L` - Clear history
 - `Ctrl+U` - Clear input
 - `Escape` - Cancel push loop (when active)

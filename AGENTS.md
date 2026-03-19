@@ -93,6 +93,20 @@ All via environment variables. No config files.
 
 ---
 
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+Enter` | Send message (works in input) |
+| `Ctrl+S` | Send message |
+| `Ctrl+P` | Toggle push mode |
+| `Ctrl+L` | Clear history |
+| `Ctrl+U` | Clear input |
+| `Q` | Quit |
+| `Escape` | Cancel in-flight request |
+
+---
+
 ## Testing
 
 Run: `pytest tests/`
@@ -128,3 +142,28 @@ Run: `pytest tests/`
 - Complicated
 
 It's a tool. Keep it that way.
+
+---
+
+## Philosophy Additions
+
+**Simplicity over Cleverness** (Hickey)
+- "Easy" ≠ "Simple". Don't sacrifice clarity for brevity.
+- Names matter. Unnamed literals are code smell.
+- Data is eternal. Functions transform data.
+
+**Explicit over Implicit** (Normand)
+- Hidden dependencies bite. Make them visible.
+- Separate actions (side effects) from calculations (pure).
+- If you have to read code to discover behavior, document it.
+
+**Correctness = Conformance to Spec** (Wayne)
+- Before fixing, define what "correct" means.
+- Test the edge cases that violate the spec, not just happy paths.
+- "Works" is not the same as "correct."
+
+**Decision Framework**
+- Don't fix what works. Fix what breaks or will break.
+- Premature optimization/generalization is complexity debt.
+- When in doubt, prefer the simpler implementation.
+- Simplicity is not about having less code - it's about code that does what it says.

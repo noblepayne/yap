@@ -21,11 +21,15 @@ _save_history = yap._save_history
 _load_prompt_file = yap._load_prompt_file
 _get_yap_done_tool = yap._get_yap_done_tool
 _detect_yap_done = yap._detect_yap_done
+_get_yap_done_summary = yap._get_yap_done_summary
 API_URL = yap.API_URL
 TIMEOUT = yap.TIMEOUT
 MAX_HISTORY = yap.MAX_HISTORY
 MAX_PUSH_ITERATIONS = yap.MAX_PUSH_ITERATIONS
 NUDGE_MESSAGE = yap.NUDGE_MESSAGE
+YAP_DONE_TOOL_NAME = yap.YAP_DONE_TOOL_NAME
+PUSH_MODE_DISCLOSURE = yap.PUSH_MODE_DISCLOSURE
+PUSH_MODE_SUMMARY_REQUEST = yap.PUSH_MODE_SUMMARY_REQUEST
 
 
 def test_strip_ansi_basic():
@@ -296,3 +300,90 @@ def test_load_prompt_file_missing(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         _load_prompt_file(tmp_path / "nonexistent.txt")
+
+
+def test_get_yap_done_summary_with_summary():
+    tool_calls = [
+        {"function": {"name": "yap__done", "arguments": '{"summary": "Task done!"}'}},
+    ]
+    assert _get_yap_done_summary(tool_calls) == "Task done!"
+
+
+def test_get_yap_done_summary_without_summary():
+    tool_calls = [
+        {"function": {"name": "yap__done", "arguments": "{}"}},
+    ]
+    assert _get_yap_done_summary(tool_calls) is None
+
+
+def test_get_yap_done_summary_no_done_call():
+    tool_calls = [
+        {"function": {"name": "other_tool", "arguments": '{"summary": "ignored"}'}},
+    ]
+    assert _get_yap_done_summary(tool_calls) is None
+
+
+def test_get_yap_done_summary_empty():
+    assert _get_yap_done_summary([]) is None
+    assert _get_yap_done_summary(None) is None
+
+
+def test_build_payload_with_push_mode_on():
+    payload = _build_payload(
+        "gpt-4", [{"role": "user", "content": "hi"}], push_mode=True
+    )
+    assert payload["model"] == "gpt-4"
+    assert "Push Mode" in payload["messages"][0]["content"]
+    assert "Status: ON" in payload["messages"][0]["content"]
+
+
+def test_build_payload_with_push_mode_off():
+    payload = _build_payload(
+        "gpt-4", [{"role": "user", "content": "hi"}], push_mode=False
+    )
+    assert payload["model"] == "gpt-4"
+    assert "Push Mode" in payload["messages"][0]["content"]
+    assert "Status: OFF" in payload["messages"][0]["content"]
+
+
+def test_build_payload_with_system_and_push_mode():
+    payload = _build_payload(
+        "gpt-4",
+        [{"role": "user", "content": "hi"}],
+        "You are helpful",
+        push_mode=True,
+    )
+    assert payload["model"] == "gpt-4"
+    system_content = payload["messages"][0]["content"]
+    assert "You are helpful" in system_content
+    assert "Push Mode" in system_content
+    assert "Status: ON" in system_content
+
+
+def test_build_payload_push_mode_none_no_disclosure():
+    payload = _build_payload(
+        "gpt-4", [{"role": "user", "content": "hi"}], push_mode=None
+    )
+    assert payload["model"] == "gpt-4"
+    assert len(payload["messages"]) == 1
+
+
+def test_push_mode_disclosure_contains_key_info():
+    formatted = PUSH_MODE_DISCLOSURE.format(status="ON")
+    assert "yap__done()" in formatted
+    assert "re-submitted" in formatted
+    assert "nudge" in formatted
+    assert "final clean response" in formatted
+    assert "no tools" in formatted
+
+
+def test_push_mode_summary_request_includes_summary():
+    msg = PUSH_MODE_SUMMARY_REQUEST.format(summary="Fixed the bug")
+    assert "Fixed the bug" in msg
+    assert "yap__done" in msg
+    assert "acknowledgment" in msg
+
+
+def test_yap_done_tool_name_constant():
+    assert YAP_DONE_TOOL_NAME == "yap__done"
+    assert _get_yap_done_tool()["function"]["name"] == YAP_DONE_TOOL_NAME
