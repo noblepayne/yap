@@ -45,9 +45,15 @@ LAST_RESPONSE_FILE = Path(os.environ.get("YAP_LAST_RESPONSE_FILE", "last_respons
 MAX_HISTORY = int(os.environ.get("YAP_MAX_HISTORY", 50))
 MAX_PUSH_ITERATIONS = int(os.environ.get("YAP_MAX_PUSH_ITERATIONS", 10))
 NUDGE_MESSAGE = (
-    "You are continuing work on the original request. Review what has been done "
-    "so far and continue. If the task is truly complete or you are stuck with no "
-    "path forward, call yap__done to exit this loop."
+    "[CONTINUE]\n"
+    "Take a fresh snapshot RIGHT NOW before doing anything else. \n"
+    "Do not reason from memory.\n\n"
+    "Then answer explicitly:\n"
+    "1. What page are you on, and what does it actually show?\n"
+    "2. What have you VERIFIED from fresh observations vs. assumed?\n"
+    "3. What is the next concrete action you will take?\n\n"
+    "Then do it. Keep working until the task is genuinely complete.\n"
+    "If truly stuck, call yap__done and explain exactly why."
 )
 
 YAP_DONE_TOOL_NAME = "yap__done"

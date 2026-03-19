@@ -69,7 +69,7 @@ def test_config_defaults():
     assert TIMEOUT == 3600
     assert MAX_HISTORY == 50
     assert MAX_PUSH_ITERATIONS == 10
-    assert "continuing work" in NUDGE_MESSAGE
+    assert "[CONTINUE]" in NUDGE_MESSAGE
     assert "yap__done" in NUDGE_MESSAGE
 
 
