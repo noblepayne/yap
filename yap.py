@@ -45,14 +45,13 @@ LAST_RESPONSE_FILE = Path(os.environ.get("YAP_LAST_RESPONSE_FILE", "last_respons
 MAX_HISTORY = int(os.environ.get("YAP_MAX_HISTORY", 50))
 MAX_PUSH_ITERATIONS = int(os.environ.get("YAP_MAX_PUSH_ITERATIONS", 10))
 NUDGE_MESSAGE = (
-    "[CONTINUE]\n"
     "Refresh your view of the system state RIGHT NOW. Do not reason from memory.\n\n"
     "Then answer explicitly:\n"
     "1. Based on immediate inspection, what is the exact status of the task environment?\n"
     "2. What have you VERIFIED through fresh observations vs. what are you still assuming?\n"
     "3. What is the next concrete action you will take to move the task forward?\n\n"
     "Then do it. Keep working until the task is genuinely complete.\n"
-    "If truly stuck, call yap__done and explain exactly why."
+    "If truly stuck or done, call yap__done and explain why."
 )
 
 YAP_DONE_TOOL_NAME = "yap__done"
