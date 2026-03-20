@@ -14,25 +14,7 @@ spec.loader.exec_module(yap)
 
 ChatInput = yap.ChatInput
 Yap = yap.Yap
-
-
-def test_chat_input_has_ctrl_enter_binding():
-    """ChatInput has ctrl+enter binding."""
-    assert hasattr(ChatInput, "BINDINGS")
-    keys = [b.key for b in ChatInput.BINDINGS]
-    assert "ctrl+enter" in keys
-
-
-def test_chat_input_ctrl_enter_priority():
-    """Ctrl+enter binding has priority=True to override TextArea defaults."""
-    binding = next(b for b in ChatInput.BINDINGS if b.key == "ctrl+enter")
-    assert binding.priority is True
-
-
-def test_chat_input_ctrl_enter_action():
-    """Ctrl+enter binding calls send action."""
-    binding = next(b for b in ChatInput.BINDINGS if b.key == "ctrl+enter")
-    assert binding.action == "send"
+TextArea = yap.TextArea
 
 
 def test_toggle_push_action_exists():
@@ -55,3 +37,12 @@ def test_toggle_push_method_callable():
     """action_toggle_push can be called (exists and is method)."""
     app = Yap()
     assert hasattr(app, "action_toggle_push")
+
+
+def test_ctrl_s_send_in_bindings():
+    """Ctrl+S is bound to send action."""
+    keys_and_actions = [
+        (b[0], b[1]) if isinstance(b, tuple) else (b.key, b.action)
+        for b in Yap.BINDINGS
+    ]
+    assert ("ctrl+s", "send") in keys_and_actions

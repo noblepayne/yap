@@ -27,7 +27,6 @@ from tenacity import (
 )
 from textual import on
 from textual.app import App, ComposeResult
-from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import (
@@ -626,10 +625,6 @@ def _load_prompt_file(path: Path) -> str:
 class ChatInput(TextArea):
     """Custom input widget that handles send keys locally."""
 
-    BINDINGS = [
-        Binding("ctrl+enter", "send", "Send", priority=True),
-    ]
-
     def action_send(self) -> None:
         if self.text.strip():
             self.app.action_send()
@@ -731,6 +726,7 @@ class Yap(App):
         ("ctrl+u", "clear_input", "Clear Input"),
         ("ctrl+p", "toggle_push", "Toggle Push"),
         ("ctrl+m", "toggle_debug", "Toggle Metadata"),
+        ("ctrl+enter", "send", "Send"),
         ("q", "quit", "Quit"),
         ("escape", "cancel_push", "Cancel Push"),
     ]
