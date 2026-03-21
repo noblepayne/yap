@@ -233,7 +233,7 @@ def test_push_mode_done_on_first(mock_llm_server):
         )
 
         data = yap._http_chat(yap.API_URL, payload, 5)
-        message = yap._parse_response(data)
+        message = yap._parse_response(data["data"])
 
         # Verify the response
         assert message.get("tool_calls") is not None
@@ -260,7 +260,7 @@ def test_push_mode_nudge_then_done(mock_llm_server):
 
         # First request
         data = yap._http_chat(yap.API_URL, payload, 5)
-        message = yap._parse_response(data)
+        message = yap._parse_response(data["data"])
         assert not yap._detect_yap_done(message.get("tool_calls"))
 
         # Add nudge
@@ -273,7 +273,7 @@ def test_push_mode_nudge_then_done(mock_llm_server):
             "test-model", history, None, [yap._get_yap_done_tool()]
         )
         data = yap._http_chat(yap.API_URL, payload, 5)
-        message = yap._parse_response(data)
+        message = yap._parse_response(data["data"])
 
         # Second request should call yap__done
         assert yap._detect_yap_done(message.get("tool_calls"))
@@ -300,7 +300,7 @@ def test_push_mode_max_iterations(mock_llm_server):
                 "test-model", history, None, [yap._get_yap_done_tool()]
             )
             data = yap._http_chat(yap.API_URL, payload, 5)
-            message = yap._parse_response(data)
+            message = yap._parse_response(data["data"])
 
             if yap._detect_yap_done(message.get("tool_calls")):
                 break
@@ -333,7 +333,7 @@ def test_push_mode_error_handling(mock_llm_server):
             "test-model", history, None, [yap._get_yap_done_tool()]
         )
         data = yap._http_chat(yap.API_URL, payload, 5)
-        message = yap._parse_response(data)
+        message = yap._parse_response(data["data"])
         # Content is unified into blocks
         assert message["content"][0]["text"] == "First response"
 
