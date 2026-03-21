@@ -35,6 +35,7 @@ from textual.widgets import (
     RadioButton,
     RadioSet,
     Static,
+    Switch,
     TextArea,
 )
 from textual_fspicker import FileOpen, Filters
@@ -322,6 +323,8 @@ def _build_payload(
     tools: list | None = None,
     push_mode: bool | None = None,
     extra_body: dict | None = None,
+    reasoning_effort: str | None = None,
+    include_search: bool | None = None,
 ) -> dict:
     """Build request payload."""
     parts = []
@@ -339,6 +342,10 @@ def _build_payload(
     payload = {"model": model, "messages": payload_messages}
     if tools is not None:
         payload["tools"] = tools
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
+    if include_search is not None:
+        payload["include_search"] = include_search
     if extra_body:
         payload["extra_body"] = extra_body
     return payload
@@ -395,7 +402,7 @@ def _truncate_history(history: list, max_size: int) -> list:
     return history
 
 
-def _format_chat_display(history: list) -> str:
+def _format_chat_display(history: list, show_reasoning: bool = True) -> str:
     """Format history for display with tool call awareness."""
     if not history:
         return "Session started. No messages yet."
@@ -415,11 +422,16 @@ def _format_chat_display(history: list) -> str:
             thoughts.append(_strip_ansi(str(reasoning_api)))
 
         # Visual styling for thoughts (SPEC §4.2)
-        if thoughts:
+        if thoughts and show_reasoning:
             reasoning_blocks = []
             for thought in thoughts:
-                reasoning_blocks.append(f"▶ Reasoning\n{thought}")
+                reasoning_blocks.append(
+                    f"▶ Reasoning\n{thought}"
+                )
             display_content = "\n\n".join(reasoning_blocks) + f"\n\n{display_text}"
+        elif thoughts and not show_reasoning:
+            # Optionally, we could still include a placeholder to indicate thoughts were suppressed
+            display_content = f"...thinking suppressed...\n\n{display_text}"
         else:
             display_content = display_text
 
@@ -719,6 +731,9 @@ class Yap(App):
     is_loading = reactive(False)
     push_mode = reactive(False)
     debug_mode = reactive(False)
+    web_search = reactive(False)
+    reasoning_effort = reactive("low")  # default to low
+    show_reasoning = reactive(True)  # default to show reasoning
 
     def __init__(self):
         super().__init__()
@@ -758,9 +773,17 @@ class Yap(App):
                 )
                 yield Static("System Prompt:")
                 yield TextArea(id="system-prompt")
-                with Horizontal(id="button-row"):
-                    yield Button("Load Prompt", id="load-prompt", variant="primary")
-                    yield Button("Load History", id="load-history", variant="primary")
+                yield Static("Web Search:")
+                yield Switch(id="web-search", value=False)
+                yield Static("Reasoning Effort:")
+                with RadioSet(id="reasoning-effort"):
+                    yield RadioButton("Low", value=True, id="reasoning-low")
+                    yield RadioButton("Medium", id="reasoning-medium")
+                    yield RadioButton("High", id="reasoning-high")
+                yield Static("Show Reasoning:")
+                yield Switch(id="show-reasoning", value=True)
+                yield Button("Load Prompt", id="load-prompt", variant="primary")
+                yield Button("Load History", id="load-history", variant="primary")
                 yield Static("Context: 0 chars | ~0 tokens", id="context-stats")
             with Vertical(id="main"):
                 with Vertical(id="chat-container"):
@@ -808,6 +831,25 @@ class Yap(App):
     @on(Button.Pressed, "#push-mode-toggle")
     def _on_push_mode_toggle(self, event: Button.Pressed) -> None:
         self.action_toggle_push()
+
+    @on(Switch.Changed, "#web-search")
+    def _on_web_search_changed(self, event: Switch.Changed) -> None:
+        self.web_search = event.value
+
+    @on(RadioSet.Changed, "#reasoning-effort")
+    def _on_reasoning_effort_changed(self, event: RadioSet.Changed) -> None:
+        if event.pressed:
+            if event.pressed.id == "reasoning-low":
+                self.reasoning_effort = "low"
+            elif event.pressed.id == "reasoning-medium":
+                self.reasoning_effort = "medium"
+            elif event.pressed.id == "reasoning-high":
+                self.reasoning_effort = "high"
+
+    @on(Switch.Changed, "#show-reasoning")
+    def _on_show_reasoning_changed(self, event: Switch.Changed) -> None:
+        self.show_reasoning = event.value
+        self._refresh_chat_display()
 
     def watch_is_loading(self, loading: bool) -> None:
         status = self.query_one("#status", Static)
@@ -950,6 +992,8 @@ class Yap(App):
                         tools,
                         push_mode_local,
                         extra_body={"session_id": self.session_id},
+                        reasoning_effort=self.reasoning_effort,
+                        include_search=self.web_search,
                     )
 
                     # Update status for push mode
@@ -981,9 +1025,7 @@ class Yap(App):
                     # Update observability state
                     self.last_obs = obs
                     if obs["session_id"] and obs["session_id"] != self.session_id:
-                        self.call_from_thread(
-                            self.update_session_id, obs["session_id"]
-                        )
+                        self.call_from_thread(self.update_session_id, obs["session_id"])
 
                     elapsed = time.time() - start_time
                     finish_reason = data.get("choices", [{}])[0].get(
@@ -1187,7 +1229,7 @@ class Yap(App):
 
     def _refresh_chat_display(self) -> None:
         chat_display = self.query_one("#chat-history", TextArea)
-        chat_display.text = _format_chat_display(self.history)
+        chat_display.text = _format_chat_display(self.history, self.show_reasoning)
         chat_display.scroll_end(animate=False)
         self._refresh_metadata_display()
 
