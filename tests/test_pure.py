@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -70,10 +71,10 @@ def test_config_defaults():
     assert MAX_HISTORY == 50
     assert MAX_PUSH_ITERATIONS == 10
     assert "yap__done" in NUDGE_MESSAGE
-    assert "{iteration}" in NUDGE_MESSAGE
-    assert "CONTINUE" in NUDGE_MESSAGE
-    assert "multi-step loop" in NUDGE_MESSAGE
-    assert "if work remains" in NUDGE_MESSAGE.lower()
+    assert "system state" in NUDGE_MESSAGE.lower()
+    assert "immediate inspection" in NUDGE_MESSAGE.lower()
+    assert "VERIFIED" in NUDGE_MESSAGE
+    assert "stuck or done" in NUDGE_MESSAGE
 
 
 def test_estimate_tokens():
@@ -448,6 +449,43 @@ def test_prepare_history_for_request_strips_thinking():
     assert projected[0]["content"][0]["type"] == "text"
     assert "omitted" in projected[0]["content"][0]["text"]
     assert "_meta" not in projected[0]
+
+
+def test_parse_footer_valid():
+    import base64
+    import hmac
+    import hashlib
+    import os
+
+    secret = "test-secret"
+    os.environ["INJECTOR_HMAC_SECRET"] = secret
+
+    data = json.dumps(
+        {
+            "turns": [
+                {"role": "assistant", "content": [{"type": "text", "text": "sub-turn"}]}
+            ]
+        }
+    )
+    hmac_val = hmac.new(secret.encode(), data.encode(), hashlib.sha256).hexdigest()
+    envelope = json.dumps({"data": data, "hmac": hmac_val})
+    b64_envelope = base64.b64encode(envelope.encode()).decode()
+
+    text = f"Final answer\n\n<!-- x-injector-v1\n{b64_envelope}\n-->"
+    payload, clean_text = yap._parse_footer(text)
+
+    assert clean_text == "Final answer"
+    assert payload["turns"][0]["role"] == "assistant"
+
+
+def test_validate_turns_rejects_user():
+    turns = [
+        {"role": "user", "content": [{"type": "text", "text": "hack"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+    ]
+    validated = yap._validate_turns(turns)
+    assert len(validated) == 1
+    assert validated[0]["role"] == "assistant"
 
 
 def test_yap_done_tool_name_constant():

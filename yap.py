@@ -4,7 +4,10 @@ yap - terminal LLM chat TUI
 Keyboard-driven. Gets out of your way.
 """
 
+import base64
+import binascii
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -13,7 +16,6 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import List, TypedDict
 
 import requests
 from tenacity import (
@@ -39,20 +41,6 @@ from textual.widgets import (
 )
 from textual_fspicker import FileOpen, Filters
 
-
-class HTTPResult(TypedDict):
-    data: dict
-    headers: dict[str, str]
-
-
-class ObsState(TypedDict):
-    session_id: str
-    turns: int
-    tools_called: List[str]
-    ms: int
-    injector_present: bool
-
-
 API_URL = os.environ.get("YAP_API_URL", "http://lattice:8089/v1/chat/completions")
 TIMEOUT = int(os.environ.get("YAP_TIMEOUT", 3600))
 HISTORY_FILE = Path(os.environ.get("YAP_HISTORY_FILE", "chat_history.jsonl"))
@@ -60,21 +48,18 @@ LAST_RESPONSE_FILE = Path(os.environ.get("YAP_LAST_RESPONSE_FILE", "last_respons
 MAX_HISTORY = int(os.environ.get("YAP_MAX_HISTORY", 50))
 MAX_PUSH_ITERATIONS = int(os.environ.get("YAP_MAX_PUSH_ITERATIONS", 10))
 
+# Injector synchronization (SPEC_YAP v2)
+INJECTOR_HMAC_SECRET = os.environ.get("INJECTOR_HMAC_SECRET")
 YAP_PROVIDER = os.environ.get("YAP_PROVIDER", "anthropic")
 
 NUDGE_MESSAGE = (
-    "CONTINUE. This is iteration {iteration}. You are in a multi-step loop.\n\n"
-    "CRITICAL:\n"
-    "1. If all requested work is verified complete: YOU MUST CALL yap__done(summary='...') NOW.\n"
-    "2. If work remains: state exactly what is missing and take the NEXT step immediately.\n\n"
-    "Do not restart the task or re-run successful tools. "
-    "Reason from fresh observations, not memory."
-)
-
-PUSH_MODE_ITERATION_WARNING = (
-    "\n\nWARNING: You are on iteration {iteration}/{max}. "
-    "If the task is complete, call yap__done NOW. Continuing without calling yap__done "
-    "may result in the loop being cancelled."
+    "Refresh your view of the system state RIGHT NOW. Do not reason from memory.\n\n"
+    "Then answer explicitly:\n"
+    "1. Based on immediate inspection, what is the exact status of the task environment?\n"
+    "2. What have you VERIFIED through fresh observations vs. what are you still assuming?\n"
+    "3. What is the next concrete action you will take to move the task forward?\n\n"
+    "Then do it. Keep working until the task is genuinely complete.\n"
+    "If truly stuck or done, call yap__done and explain why."
 )
 
 YAP_DONE_TOOL_NAME = "yap__done"
@@ -113,77 +98,6 @@ def _strip_ansi(text: str) -> str:
     """Strip ANSI escape sequences from a string."""
     ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
     return ansi_escape.sub("", text)
-
-
-def empty_obs() -> ObsState:
-    """Factory for an inactive ObsState with safe defaults."""
-    return ObsState(
-        session_id="",
-        turns=0,
-        tools_called=[],
-        ms=0,
-        injector_present=False,
-    )
-
-
-def parse_obs(headers: dict[str, str]) -> ObsState:
-    """Parse X-Injector-* headers into ObsState.
-
-    Case-insensitive header matching. Safe to call with any headers dict.
-    Returns empty ObsState if no injector headers present.
-    """
-    normalised = {k.lower(): v for k, v in headers.items()}
-
-    present = "x-injector-version" in normalised
-    if not present:
-        return empty_obs()
-
-    session = normalised.get("x-injector-session", "")
-
-    turns_raw = normalised.get("x-injector-turns", "0")
-    try:
-        turns = int(turns_raw)
-    except (ValueError, TypeError):
-        turns = 0
-
-    tools_raw = normalised.get("x-injector-tools", "")
-    tools = [t.strip() for t in tools_raw.split(",") if t.strip()]
-
-    ms_raw = normalised.get("x-injector-ms", "0")
-    try:
-        ms = int(ms_raw)
-    except (ValueError, TypeError):
-        ms = 0
-
-    return ObsState(
-        session_id=session,
-        turns=turns,
-        tools_called=tools,
-        ms=ms,
-        injector_present=True,
-    )
-
-
-def format_obs_status(obs: ObsState, max_tools: int = 3) -> str:
-    """Format a one-line status string for the UI status bar.
-
-    Args:
-        obs: The Observability state to format.
-        max_tools: Maximum number of tools to display before truncation.
-
-    Returns empty string if injector not present.
-    """
-    if not obs["injector_present"]:
-        return ""
-    parts = [f"Turns: {obs['turns']}"]
-    if obs["tools_called"]:
-        tools_display = ", ".join(obs["tools_called"][:max_tools])
-        if len(obs["tools_called"]) > max_tools:
-            tools_display += f" +{len(obs['tools_called']) - max_tools} more"
-        parts.append(f"Tools: {tools_display}")
-    if obs["ms"]:
-        parts.append(f"{obs['ms']}ms")
-    return " | ".join(parts)
 
 
 def _safe_write(path: Path, content: str) -> None:
@@ -313,6 +227,107 @@ def _prepare_history_for_request(
             result.append({k: v for k, v in message.items() if k != "_meta"})
 
     return result
+
+
+FOOTER_RE = re.compile(r"\s*<!-- x-injector-v1\n(.+?)\n-->", re.DOTALL)
+
+
+def _parse_footer(text: str) -> tuple[dict | None, str]:
+    """
+    Detect, verify, and extract the injector footer from a response string.
+
+    Returns:
+        (payload, clean_text) where:
+            payload   — the verified payload dict, or None if absent/invalid
+            clean_text — the response text with the footer sentinel stripped
+    """
+    m = FOOTER_RE.search(text)
+    if not m:
+        # No footer present — normal for non-Injector endpoints
+        return None, text
+
+    clean_text = FOOTER_RE.sub("", text).rstrip()
+    raw_b64 = m.group(1).strip()
+
+    secret = os.environ.get("INJECTOR_HMAC_SECRET")
+    if not secret:
+        logging.warning(
+            "injector footer present but INJECTOR_HMAC_SECRET is not set — "
+            "discarding footer without parsing"
+        )
+        return None, clean_text
+
+    try:
+        envelope_bytes = base64.b64decode(raw_b64)
+        envelope = json.loads(envelope_bytes.decode("utf-8"))
+
+        # REVISE: Binary HMAC comparison for high-fidelity security
+        expected_digest = hmac.new(
+            secret.encode("utf-8"),
+            envelope["data"].encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+
+        provided_digest = binascii.unhexlify(envelope["hmac"])
+
+        if not hmac.compare_digest(expected_digest, provided_digest):
+            logging.warning(
+                "injector footer HMAC mismatch — discarding footer. "
+                "This may indicate a misconfigured secret or a tampered payload."
+            )
+            return None, clean_text
+
+        payload = json.loads(envelope["data"])
+
+    except (KeyError, ValueError, binascii.Error) as e:
+        logging.warning(f"injector footer parse error ({e}) — discarding footer")
+        return None, clean_text
+
+    return payload, clean_text
+
+
+def _validate_turns(turns: list[dict]) -> list[dict]:
+    """
+    Validate and filter turns from an injector footer payload.
+
+    Allowed roles: "assistant", "tool"
+    Disallowed roles: "system", "user" — these are dropped with a warning.
+
+    Returns the validated (possibly shorter) list of turns.
+    """
+    ALLOWED_ROLES = {"assistant", "tool"}
+    validated = []
+
+    for i, turn in enumerate(turns):
+        role = turn.get("role")
+
+        if role not in ALLOWED_ROLES:
+            logging.warning(
+                f"injector footer turn {i} has disallowed role '{role}' — "
+                f"dropping. This may indicate a prompt injection attempt."
+            )
+            continue
+
+        # Ensure content is present and is a list
+        if "content" not in turn or not isinstance(turn["content"], list):
+            logging.warning(
+                f"injector footer turn {i} has malformed content — dropping"
+            )
+            continue
+
+        # Reject any turn whose content contains the footer sentinel string
+        # (defense against injection via tool results)
+        content_str = json.dumps(turn["content"])
+        if "x-injector-v1" in content_str:
+            logging.warning(
+                f"injector footer turn {i} contains protocol marker in content — "
+                f"dropping. Possible injection attempt."
+            )
+            continue
+
+        validated.append(turn)
+
+    return validated
 
 
 def _build_payload(
@@ -539,7 +554,7 @@ def _http_chat(
     timeout: int,
     session: requests.Session | None = None,
     cancel_event: threading.Event | None = None,
-) -> HTTPResult:
+) -> dict:
     """Make HTTP POST to LLM endpoint with retries."""
     s = session or requests.Session()
 
@@ -576,7 +591,7 @@ def _http_chat(
         if 500 <= r.status_code < 600:
             r.raise_for_status()
         r.raise_for_status()
-        return HTTPResult(data=r.json(), headers=dict(r.headers))
+        return r.json()
 
     return _do_post()
 
@@ -728,12 +743,20 @@ class Yap(App):
         self._http_session: requests.Session | None = None
         self._http_session_lock = threading.Lock()
         self.session_id = derive_session_id(HISTORY_FILE)
-        self.last_obs: ObsState = empty_obs()
+        self.last_footer_stats = {
+            "len": 0,
+            "spliced": 0,
+        }
         self._load_history()
+        # Log configuration (SPEC_YAP T1)
         logging.info(
             f"YAP_PROVIDER={YAP_PROVIDER} session_id={self.session_id} "
             f"history_file={HISTORY_FILE}"
         )
+        if not INJECTOR_HMAC_SECRET:
+            logging.warning(
+                "INJECTOR_HMAC_SECRET not set - injector footer verification disabled"
+            )
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -779,6 +802,56 @@ class Yap(App):
     def _load_history(self) -> None:
         self.history = _load_history(HISTORY_FILE)
         self.history = _truncate_history(self.history, MAX_HISTORY)
+
+    def _splice_injected_history(self, message: dict) -> list[dict]:
+        """
+        Parse the injector footer from message content, validate its contents,
+        and return a list of sub-turns to be spliced.
+        Also updates the message content to strip the footer.
+        """
+        # SPEC_YAP P3: Work with typed blocks
+        thoughts, text = _extract_thoughts(message.get("content", []))
+        payload, clean_text = _parse_footer(text)
+
+        if payload is None:
+            self.last_footer_stats["len"] = 0
+            self.last_footer_stats["spliced"] = 0
+            return []
+
+        # Update footer stats for debug toggle (T10)
+        m = FOOTER_RE.search(text)
+        if m:
+            self.last_footer_stats["len"] = len(m.group(1))
+
+        # Update message content to the clean text (preserving thoughts)
+        new_blocks = []
+        for t in thoughts:
+            new_blocks.append({"type": "thinking", "thinking": t})
+        if clean_text:
+            new_blocks.append({"type": "text", "text": clean_text})
+        message["content"] = new_blocks
+
+        raw_turns = payload.get("turns", [])
+        if not raw_turns:
+            self.last_footer_stats["spliced"] = 0
+            return []
+
+        validated_turns = _validate_turns(raw_turns)
+        if not validated_turns:
+            logging.warning("injector footer had turns but none passed validation")
+            self.last_footer_stats["spliced"] = 0
+            return []
+
+        source_provider = payload.get("source", "unknown")
+        for turn in validated_turns:
+            turn.setdefault("_meta", {})["provider"] = source_provider
+
+        self.last_footer_stats["spliced"] = len(validated_turns)
+        logging.debug(
+            f"extracted {len(validated_turns)} turns from injector footer "
+            f"(session: {payload.get('session_id', 'unknown')})"
+        )
+        return validated_turns
 
     def _save_history(self) -> None:
         with self._history_lock:
@@ -956,16 +1029,19 @@ class Yap(App):
                         )
 
                     # Make request
-                    result = _http_chat(
+                    data = _http_chat(
                         API_URL, payload, TIMEOUT, session, self._push_cancelled
                     )
-                    data = result["data"]
-                    obs = parse_obs(result["headers"])
                     message = _parse_response(data)
-                    # Tag with current provider for stripping logic
+                    # REVISE: Tag with current provider for stripping logic
                     message.setdefault("_meta", {})["provider"] = YAP_PROVIDER
 
+                    # T7/T5 REVISE: Atomic splicing
+                    spliced_turns = self._splice_injected_history(message)
+
                     with self._history_lock:
+                        if spliced_turns:
+                            self.history.extend(spliced_turns)
                         self.history.append(message)
                         self.history = _truncate_history(self.history, MAX_HISTORY)
 
@@ -973,15 +1049,6 @@ class Yap(App):
                     _, clean_text = _extract_thoughts(message.get("content", []))
                     _safe_write(LAST_RESPONSE_FILE, clean_text)
                     self._save_history()
-
-                    # Update observability state
-                    self.last_obs = obs
-                    # Thread-safe session_id sync: use call_from_thread to ensure
-                    # UI-thread safety when updating instance state from worker
-                    if obs["session_id"] and obs["session_id"] != self.session_id:
-                        self.call_from_thread(
-                            setattr, self, "session_id", obs["session_id"]
-                        )
 
                     elapsed = time.time() - start_time
                     finish_reason = data.get("choices", [{}])[0].get(
@@ -991,13 +1058,10 @@ class Yap(App):
                     # Check if push mode logic should apply
                     if not push_mode_local:
                         # Single request mode
-                        obs_str = format_obs_status(obs)
-                        status_msg = (
-                            f"Success ({elapsed:.1f}s) | Finish: {finish_reason}"
+                        self.update_status(
+                            f"Success ({elapsed:.1f}s) | Finish: {finish_reason}",
+                            "success",
                         )
-                        if obs_str:
-                            status_msg = f"Success ({elapsed:.1f}s) | {obs_str} | Finish: {finish_reason}"
-                        self.update_status(status_msg, "success")
                         break
 
                     # Push mode: check for yap__done tool call
@@ -1034,24 +1098,24 @@ class Yap(App):
                             "[PUSH DONE] Final summary round...",
                             "normal",
                         )
-                        final_result = _http_chat(
+                        final_data = _http_chat(
                             API_URL,
                             final_payload,
                             TIMEOUT,
                             session,
                             self._push_cancelled,
                         )
-                        final_data = final_result["data"]
-                        final_obs = parse_obs(final_result["headers"])
                         final_message = _parse_response(final_data)
                         final_message.setdefault("_meta", {})["provider"] = YAP_PROVIDER
 
+                        # Splice footer if present even in final round
+                        final_spliced = self._splice_injected_history(final_message)
+
                         with self._history_lock:
+                            if final_spliced:
+                                self.history.extend(final_spliced)
                             self.history.append(final_message)
                             self.history = _truncate_history(self.history, MAX_HISTORY)
-
-                        # Update observability state for final round
-                        self.last_obs = final_obs
 
                         _, final_clean_text = _extract_thoughts(
                             final_message.get("content", [])
@@ -1082,14 +1146,8 @@ class Yap(App):
                         break
 
                     # Nudge: add continuation message AFTER successful response
-                    nudge = NUDGE_MESSAGE.format(iteration=iteration + 1)
-                    if iteration >= 7:
-                        nudge += PUSH_MODE_ITERATION_WARNING.format(
-                            iteration=iteration + 1,
-                            max=MAX_PUSH_ITERATIONS,
-                        )
                     with self._history_lock:
-                        self.history.append({"role": "user", "content": nudge})
+                        self.history.append({"role": "user", "content": NUDGE_MESSAGE})
                         self.history = _truncate_history(self.history, MAX_HISTORY)
 
                     self._save_history()
@@ -1163,20 +1221,13 @@ class Yap(App):
             return
 
         debug_panel = self.query_one("#metadata-debug", Static)
-        obs = self.last_obs
-        if obs["injector_present"]:
-            tools_str = (
-                ", ".join(obs["tools_called"]) if obs["tools_called"] else "none"
-            )
-            debug_text = (
-                f"Session: {obs['session_id']} | "
-                f"Provider: {YAP_PROVIDER} | "
-                f"Turns: {obs['turns']} | "
-                f"Tools: {tools_str} | "
-                f"Time: {obs['ms']}ms"
-            )
-        else:
-            debug_text = f"No injector detected | Provider: {YAP_PROVIDER} | Session: {self.session_id}"
+        stats = self.last_footer_stats
+        debug_text = (
+            f"Footer: {stats['len']} bytes | "
+            f"Spliced: {stats['spliced']} turns | "
+            f"Session: {self.session_id} | "
+            f"Provider: {YAP_PROVIDER}"
+        )
         debug_panel.update(debug_text)
 
     async def action_quit(self) -> None:
