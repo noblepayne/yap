@@ -404,6 +404,38 @@ def test_build_payload_with_system_and_push_mode():
     assert system_content.index("Push Mode") < system_content.index("You are helpful")
 
 
+def test_build_payload_with_reasoning_effort():
+    payload = _build_payload(
+        "gpt-4", [{"role": "user", "content": "hi"}], reasoning_effort="low"
+    )
+    assert payload["reasoning_effort"] == "low"
+
+
+def test_build_payload_with_include_search():
+    payload = _build_payload(
+        "gpt-4", [{"role": "user", "content": "hi"}], include_search=True
+    )
+    assert payload["include_search"] is True
+
+
+def test_build_payload_with_all_new_options():
+    payload = _build_payload(
+        "gpt-4",
+        [{"role": "user", "content": "hi"}],
+        system_prompt="test",
+        reasoning_effort="high",
+        include_search=False,
+    )
+    assert payload["model"] == "gpt-4"
+    assert len(payload["messages"]) == 2  # system + user message
+    assert payload["messages"][0]["role"] == "system"
+    assert payload["messages"][0]["content"] == "test"
+    assert payload["messages"][1]["role"] == "user"
+    assert payload["messages"][1]["content"] == "hi"
+    assert payload["reasoning_effort"] == "high"
+    assert payload["include_search"] is False
+
+
 def test_build_payload_push_mode_none_no_disclosure():
     payload = _build_payload(
         "gpt-4", [{"role": "user", "content": "hi"}], push_mode=None
