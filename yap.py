@@ -735,6 +735,10 @@ class Yap(App):
             f"history_file={HISTORY_FILE}"
         )
 
+    def update_session_id(self, session_id: str) -> None:
+        """Update the session ID from a background thread."""
+        self.session_id = session_id
+
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal():
@@ -976,11 +980,9 @@ class Yap(App):
 
                     # Update observability state
                     self.last_obs = obs
-                    # Thread-safe session_id sync: use call_from_thread to ensure
-                    # UI-thread safety when updating instance state from worker
                     if obs["session_id"] and obs["session_id"] != self.session_id:
                         self.call_from_thread(
-                            setattr, self, "session_id", obs["session_id"]
+                            self.update_session_id, obs["session_id"]
                         )
 
                     elapsed = time.time() - start_time
