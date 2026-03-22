@@ -415,7 +415,7 @@ def test_build_payload_with_include_search():
     payload = _build_payload(
         "gpt-4", [{"role": "user", "content": "hi"}], include_search=True
     )
-    assert payload["include_search"] is True
+    assert payload["plugins"] == [{"id": "web"}]
 
 
 def test_build_payload_with_all_new_options():
@@ -433,7 +433,7 @@ def test_build_payload_with_all_new_options():
     assert payload["messages"][1]["role"] == "user"
     assert payload["messages"][1]["content"] == "hi"
     assert payload["reasoning_effort"] == "high"
-    assert payload["include_search"] is False
+    assert "plugins" not in payload
 
 
 def test_build_payload_push_mode_none_no_disclosure():

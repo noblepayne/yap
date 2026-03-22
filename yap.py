@@ -344,8 +344,8 @@ def _build_payload(
         payload["tools"] = tools
     if reasoning_effort is not None:
         payload["reasoning_effort"] = reasoning_effort
-    if include_search is not None:
-        payload["include_search"] = include_search
+    if include_search:
+        payload["plugins"] = [{"id": "web"}]
     if extra_body:
         payload["extra_body"] = extra_body
     return payload
@@ -425,9 +425,7 @@ def _format_chat_display(history: list, show_reasoning: bool = True) -> str:
         if thoughts and show_reasoning:
             reasoning_blocks = []
             for thought in thoughts:
-                reasoning_blocks.append(
-                    f"▶ Reasoning\n{thought}"
-                )
+                reasoning_blocks.append(f"▶ Reasoning\n{thought}")
             display_content = "\n\n".join(reasoning_blocks) + f"\n\n{display_text}"
         elif thoughts and not show_reasoning:
             # Optionally, we could still include a placeholder to indicate thoughts were suppressed
@@ -981,17 +979,25 @@ class Yap(App):
 
                     # Build payload for current iteration
                     with self._history_lock:
-                        # SPEC_YAP T6: prepare history (stripping thoughts from other providers)
-                        current_history = _prepare_history_for_request(
-                            self.history, YAP_PROVIDER
-                        )
+                        # SPEC_YAP T6: If injector is present, it handles history projection
+                        # Otherwise, fallback to YAP_PROVIDER-based preparation
+                        if self.last_obs.get("injector_present"):
+                            current_history = list(
+                                self.history
+                            )  # Send raw history with _meta
+                        else:
+                            current_history = _prepare_history_for_request(
+                                self.history, YAP_PROVIDER
+                            )
                     payload = _build_payload(
                         model,
                         current_history,
                         system_prompt or None,
                         tools,
                         push_mode_local,
-                        extra_body={"session_id": self.session_id},
+                        extra_body={
+                            "session-id": self.session_id
+                        },  # Hyphen for injector compatibility
                         reasoning_effort=self.reasoning_effort,
                         include_search=self.web_search,
                     )
@@ -1072,7 +1078,7 @@ class Yap(App):
                             system_prompt or None,
                             None,
                             None,
-                            extra_body={"session_id": self.session_id},
+                            extra_body={"session-id": self.session_id},
                         )
                         self.update_status(
                             "[PUSH DONE] Final summary round...",
