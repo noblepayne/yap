@@ -101,6 +101,7 @@ All via environment variables. No config files.
 | `Ctrl+S` | Send message |
 | `Ctrl+P` | Toggle push mode |
 | `Ctrl+L` | Clear history |
+| `Ctrl+R` | Reset session (clear history + new session ID, keeps prompt) |
 | `Ctrl+U` | Clear input |
 | `Q` | Quit |
 | `Escape` | Cancel in-flight request |

@@ -12,6 +12,7 @@ import re
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import List, TypedDict
 
@@ -718,6 +719,7 @@ class Yap(App):
     BINDINGS = [
         ("ctrl+s", "send", "Send"),
         ("ctrl+l", "clear_history", "Clear History"),
+        ("ctrl+r", "reset_session", "Reset Session"),
         ("ctrl+u", "clear_input", "Clear Input"),
         ("ctrl+p", "toggle_push", "Toggle Push"),
         ("ctrl+m", "toggle_debug", "Toggle Metadata"),
@@ -1170,6 +1172,25 @@ class Yap(App):
             logging.error(f"Failed to delete history file: {e}")
         self._refresh_chat_display()
         self._update_status_text("History Cleared")
+
+    def action_reset_session(self) -> None:
+        """Clear history, generate a new session ID, reset injector state.
+
+        System prompt is preserved (we don't touch #system-prompt).
+        The history file is deleted so the injector can't rehydrate corrupted state.
+        """
+        with self._history_lock:
+            self.history = []
+        try:
+            HISTORY_FILE.unlink(missing_ok=True)
+        except Exception as e:
+            logging.error(f"Failed to delete history file: {e}")
+        self.session_id = uuid.uuid4().hex[:16]
+        self.last_obs = empty_obs()
+        self._update_status_text(f"Session reset (id={self.session_id})", "success")
+        self._refresh_chat_display()
+        self._refresh_context_stats()
+        logging.info(f"Session reset: new session_id={self.session_id}")
 
     def action_clear_input(self) -> None:
         self.query_one("#user-input", ChatInput).text = ""

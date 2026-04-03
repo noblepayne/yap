@@ -46,3 +46,14 @@ def test_ctrl_s_send_in_bindings():
         for b in Yap.BINDINGS
     ]
     assert ("ctrl+s", "send") in keys_and_actions
+
+
+def test_ctrl_r_reset_session_in_bindings():
+    """Ctrl+R is bound to reset_session action."""
+    keys_and_actions = [
+        (b[0], b[1]) if isinstance(b, tuple) else (b.key, b.action)
+        for b in Yap.BINDINGS
+    ]
+    assert ("ctrl+r", "reset_session") in keys_and_actions
+    assert hasattr(Yap, "action_reset_session")
+    assert callable(Yap.action_reset_session)
