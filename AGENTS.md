@@ -82,6 +82,7 @@ All via environment variables. No config files.
 | `YAP_LAST_RESPONSE_FILE` | `last_response.md` | Last response output |
 | `YAP_MAX_HISTORY` | `50` | Max messages to keep |
 | `YAP_MAX_PUSH_ITERATIONS` | `10` | Max iterations in push mode |
+| `YAP_THEME` | `nord` | Textual theme name (any builtin: tokyo-night, gruvbox, dracula, ...) |
 
 ---
 
@@ -104,6 +105,8 @@ All via environment variables. No config files.
 | `Ctrl+L` | Clear history |
 | `Ctrl+R` | Reset session (clear history + new session ID, keeps prompt) |
 | `Ctrl+U` | Clear input |
+| `y` | Copy last response to clipboard (OSC52) |
+| `Y` | Copy full transcript to clipboard |
 | `Q` | Quit |
 | `Escape` | Cancel in-flight request |
 
