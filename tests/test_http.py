@@ -215,6 +215,73 @@ def test_replay_hermes_buffered():
         server.stop()
 
 
+# --- Tool calls over real SSE ---
+
+
+def test_replay_bifrost_toolcall():
+    """Real captured tool-call stream: reasoning → complete function call."""
+    server = ChatServer(chunks=load_fixture("bifrost_toolcall")).start()
+    try:
+        result = yap._http_chat(
+            server.url,
+            {"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            10,
+            on_delta=lambda _: None,
+        )
+        msg = result["data"]["choices"][0]["message"]
+        tcs = msg["tool_calls"]
+        assert len(tcs) == 1
+        assert tcs[0]["function"]["name"] == "get_weather"
+        args = json.loads(tcs[0]["function"]["arguments"])
+        assert args == {"city": "Tokyo"}
+        assert tcs[0]["id"], "tool call id should be preserved"
+        assert result["data"]["choices"][0]["finish_reason"] == "tool_calls"
+    finally:
+        server.stop()
+
+
+def test_stream_fragmented_toolcall_accumulation(chat_server):
+    """Arguments split across deltas accumulate; parallel calls sort by index.
+
+    Live endpoints sometimes emit whole calls (see bifrost fixture), but the
+    OpenAI contract allows argument fragments — this is the hard-to-trigger
+    case the assembly logic exists for.
+    """
+    chat_server.chunks = [
+        {"choices": [{"delta": {"role": "assistant", "content": ""}}]},
+        # First call: id+name, then arguments in three fragments
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "call_a", "function": {"name": "get_weather"}}
+        ]}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": '{"city":'}}
+        ]}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": '"Tokyo", '}}
+        ]}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": '"unit": "c"}'}}
+        ]}}]},
+        # Second parallel call at index 1
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 1, "id": "call_b", "function": {
+                "name": "get_time", "arguments": '{"tz":"pst"}'}}
+        ]}}]},
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+    result = yap._http_chat(
+        chat_server.url,
+        {"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+        10,
+        on_delta=lambda _: None,
+    )
+    msg = result["data"]["choices"][0]["message"]
+    tcs = msg["tool_calls"]
+    assert [tc["id"] for tc in tcs] == ["call_a", "call_b"]  # sorted by index
+    assert json.loads(tcs[0]["function"]["arguments"]) == {"city": "Tokyo", "unit": "c"}
+    assert json.loads(tcs[1]["function"]["arguments"]) == {"tz": "pst"}
+
+
 def test_replay_bifrost_reasoning_and_text():
     """Rich bifrost fixture: stream produces BOTH thinking and text blocks."""
     server = ChatServer(chunks=load_fixture("bifrost_reasoning_text")).start()
