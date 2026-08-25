@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import List, TypedDict
 
 import requests
+from rich.text import Text
 from tenacity import (
     before_sleep_log,
     retry,
@@ -33,8 +34,10 @@ from textual.widgets import (
     Footer,
     Header,
     Input,
+    Markdown,
     RadioButton,
     RadioSet,
+    RichLog,
     Static,
     Switch,
     TextArea,
@@ -507,6 +510,22 @@ def _truncate_history(history: list, max_size: int) -> list:
     return history
 
 
+def _format_tool_call(call: dict) -> str:
+    """One-line human-readable tool call: ⚙ name(args) with canonical JSON.
+
+    Falls back to the raw argument string if it isn't valid JSON (proxies
+    sometimes mangle it — showing raw beats crashing the UI).
+    """
+    func = call.get("function", {})
+    name = func.get("name", "unknown")
+    raw = func.get("arguments", "{}")
+    try:
+        args_str = json.dumps(json.loads(raw))
+    except Exception:
+        args_str = str(raw).strip() or "{}"
+    return f"⚙ {name}({args_str})"
+
+
 def _format_chat_display(history: list, show_reasoning: bool = True) -> str:
     """Format history for display with tool call awareness."""
     if not history:
@@ -806,6 +825,24 @@ class Yap(App):
         border: solid $accent;
     }
 
+    #chat-history {
+        height: 1fr;
+        background: transparent;
+        padding: 0 1;
+        border: none;
+    }
+
+    #stream-pane {
+        display: none;
+        height: 14;
+        border-top: solid $panel;
+        padding: 0 1;
+    }
+
+    #stream-pane.streaming {
+        display: block;
+    }
+
     #input-container {
         height: 12;
         border: solid $success;
@@ -875,6 +912,8 @@ class Yap(App):
         ("ctrl+u", "clear_input", "Clear Input"),
         ("ctrl+p", "toggle_push", "Toggle Push"),
         ("ctrl+m", "toggle_debug", "Toggle Metadata"),
+        ("y", "copy_last_response", "Copy Last"),
+        ("Y", "copy_transcript", "Copy All"),
         ("ctrl+enter", "send", "Send"),
         ("q", "quit", "Quit"),
         ("escape", "cancel_push", "Cancel Push"),
@@ -940,7 +979,8 @@ class Yap(App):
             with Vertical(id="main"):
                 with Vertical(id="chat-container"):
                     yield Static("CONVERSATION", classes="header-text")
-                    yield TextArea(read_only=True, id="chat-history")
+                    yield RichLog(id="chat-history", highlight=False, wrap=True)
+                    yield Markdown("", id="stream-pane", classes="stream-pane")
                     yield Static(id="metadata-debug", classes="debug-info")
                 yield Static("Push Mode:")
                 yield Button("Push Mode: Off", id="push-mode-toggle", variant="default")
@@ -951,6 +991,7 @@ class Yap(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        self.theme = os.environ.get("YAP_THEME", "nord")
         self._refresh_chat_display()
         self._refresh_context_stats()
         self._update_status_text("Ready")
@@ -1388,6 +1429,32 @@ class Yap(App):
             button.variant = "default"
             self._update_status_text("Push Mode disabled", "normal")
 
+    def _copy_to_clipboard(self, text: str, label: str) -> None:
+        try:
+            self.copy_to_clipboard(text)
+            self._update_status_text(f"Copied {label} ({len(text):,} chars)", "success")
+        except Exception as e:
+            self._update_status_text(f"Copy failed: {e}", "error")
+
+    def action_copy_last_response(self) -> None:
+        """Copy the most recent assistant reply (plain text) to the clipboard."""
+        for msg in reversed(self.history):
+            if msg.get("role") == "assistant":
+                _, display_text = _extract_thoughts(msg.get("content") or "")
+                text = display_text.strip()
+                for call in msg.get("tool_calls") or []:
+                    text += f"\n{_format_tool_call(call)}"
+                if not text:
+                    continue
+                self._copy_to_clipboard(text, "last response")
+                return
+        self._update_status_text("No assistant response to copy", "normal")
+
+    def action_copy_transcript(self) -> None:
+        """Copy the whole session transcript (plain text) to the clipboard."""
+        text = _format_chat_display(self.history, self.show_reasoning)
+        self._copy_to_clipboard(text, "transcript")
+
     def action_cancel_push(self) -> None:
         """Cancel any in-flight request (push or single)."""
         if self.is_loading:
@@ -1434,20 +1501,65 @@ class Yap(App):
         self.exit()
 
     def _refresh_chat_display(self) -> None:
-        chat_display = self.query_one("#chat-history", TextArea)
-        chat_display.text = _format_chat_display(self.history, self.show_reasoning)
-        chat_display.scroll_end(animate=False)
+        log = self.query_one("#chat-history", RichLog)
+        log.clear()
+        self._write_transcript(log)
+        stream = self.query_one("#stream-pane", Markdown)
+        stream.update("")
+        stream.remove_class("streaming")
         self._refresh_metadata_display()
 
+    def _write_transcript(self, log: RichLog) -> None:
+        """Render history as styled segments. Text objects, never markup
+        strings — model output may contain square brackets."""
+        if not self.history:
+            log.write(Text("Session started. No messages yet.", style="dim"))
+            return
+        for msg in self.history:
+            role = msg.get("role", "UNKNOWN").upper()
+            content = msg.get("content") or ""
+            tool_calls = msg.get("tool_calls")
+            thoughts, display_text = _extract_thoughts(content)
+
+            reasoning_api = msg.get("reasoning_content") or msg.get("thought")
+            if reasoning_api:
+                thoughts.append(_strip_ansi(str(reasoning_api)))
+
+            header_style = {
+                "USER": "bold cyan",
+                "ASSISTANT": "bold green",
+                "TOOL": "bold yellow",
+            }.get(role, "bold white")
+            log.write(Text(f"[{role}]", style=header_style))
+
+            if thoughts and self.show_reasoning:
+                log.write(Text("\n".join(thoughts), style="dim italic"))
+            elif thoughts:
+                log.write(Text("…thinking suppressed…", style="dim"))
+
+            if display_text.strip():
+                log.write(Text(display_text))
+
+            for call in tool_calls or []:
+                call_id = call.get("id", "no-id")
+                line = Text(_format_tool_call(call), style="magenta")
+                line.append(Text(f"  [CALL:{call_id}]", style="dim"))
+                log.write(line)
+
+            if role == "TOOL":
+                name = msg.get("name", "unknown")
+                log.write(
+                    Text(f"tool result · {name}", style="dim italic yellow")
+                )
+            log.write(Text("─" * 40, style="dim"))
+
     def _update_stream_display(self, text: str) -> None:
-        """Show in-progress streamed response appended after history."""
-        chat_display = self.query_one("#chat-history", TextArea)
-        base = _format_chat_display(self.history, self.show_reasoning)
-        stream_text = f"{text}\n▌"
-        chat_display.text = f"{base}\n\n[ASSISTANT · streaming]\n{stream_text}\n" + (
-            "-" * 40
-        )
-        chat_display.scroll_end(animate=False)
+        """Update only the in-flight response pane — O(current message),
+        never a full transcript rebuild."""
+        stream = self.query_one("#stream-pane", Markdown)
+        stream.update(f"{text}\n▌")
+        stream.add_class("streaming")
+        stream.scroll_end(animate=False)
 
     def _refresh_context_stats(self) -> None:
         system_prompt = self.query_one("#system-prompt", TextArea).text
