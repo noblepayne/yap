@@ -5,19 +5,14 @@ import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-import sys
 
-import importlib.util
 
 import pytest
 
 # Add project root to path
 root = Path(__file__).parent.parent
-sys.path.insert(0, str(root))  # noqa: E402
 
-spec = importlib.util.spec_from_file_location("yap", root / "yap.py")
-yap = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(yap)
+from yap_module import yap
 
 
 class MockLLMHandler(BaseHTTPRequestHandler):

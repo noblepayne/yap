@@ -14,8 +14,14 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.3.5",
+    "pytest-timeout>=2.3.1",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+pythonpath = ["tests"]
+# Requires pytest-timeout (dev dep). Guards against hung servers / retry loops.
+timeout = 60

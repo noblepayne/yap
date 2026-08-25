@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Probe a live chat-completions endpoint before using it.
+
+Checks model availability, measures latency-to-first-delta, and
+verifies whether the endpoint actually streams. Catches assumptions
+about URLs, model names, and timeouts before they become surprise
+failures in real usage.
+
+Usage:
+    bin/probe <url> <model> [--key <api_key>] [--record <fixture_name>]
+    bin/probe http://100.65.102.108:8642/v1 hermes-agent --key Ez4h...
+    bin/probe http://prism:8080/v1 groq/openai/gpt-oss-120b --record bifrost_probe
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import requests
+
+
+def probe(url_base: str, model: str, api_key: str | None = None, record: str | None = None):
+    url = f"{url_base}/chat/completions"
+    models_url = f"{url_base}/models"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    print(f"\n{'─' * 60}")
+    print(f"  Probing: {model}")
+    print(f"  Endpoint: {url}")
+    print(f"{'─' * 60}\n")
+
+    # --- 1. List models ---
+    print("▸ Models endpoint ... ", end="", flush=True)
+    try:
+        r = requests.get(models_url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            models = [m["id"] for m in data.get("data", [])]
+            found = any(model in m for m in models)
+            print(f"{len(models)} models, {model}: {'✓ FOUND' if found else '✗ NOT FOUND'}")
+            if not found and models:
+                print(f"  Available: {', '.join(models[:8])}{'...' if len(models) > 8 else ''}")
+        else:
+            print(f"HTTP {r.status_code} (non-fatal, some endpoints skip /models)")
+    except requests.exceptions.ConnectionError as e:
+        print(f"Connection failed: {e}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+    # --- 2. Non-streaming request (latency baseline) ---
+    print("\n▸ Non-streaming request ... ", end="", flush=True)
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Say exactly: hello probe"}],
+        "max_tokens": 10,
+        "stream": False,
+    }
+    try:
+        start = time.time()
+        r = requests.post(url, json=payload, headers=headers, timeout=60)
+        elapsed = time.time() - start
+        if r.status_code == 200:
+            data = r.json()
+            usage = data.get("usage", {})
+            print(f"{elapsed:.1f}s, status 200")
+            print(f"  prompt: {usage.get('prompt_tokens', '?')} tok | "
+                  f"completion: {usage.get('completion_tokens', '?')} tok")
+        else:
+            print(f"HTTP {r.status_code}: {r.text[:200]}")
+    except requests.exceptions.ConnectionError as e:
+        print(f"Connection failed: {e}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+    # --- 3. Streaming request ---
+    print("\n▸ Streaming request ... ", end="", flush=True)
+    stream_payload = {
+        **payload,
+        "stream": True,
+    }
+    recorded = []
+    try:
+        start = time.time()
+        first_delta_time = None
+        content_type = None
+        with requests.post(url, json=stream_payload, headers=headers, timeout=120, stream=True) as r:
+            status = r.status_code
+            content_type = r.headers.get("Content-Type", "")
+
+            if status == 401:
+                print("HTTP 401 — authentication failed, check your API key")
+            elif "text/event-stream" not in content_type:
+                # Endpoint ignores stream:true and replies with JSON.
+                # Record as a single-line JSON object so load_fixture can parse it.
+                print(f"NOT SSE (HTTP {status}, Content-Type: {content_type})")
+                print("  → Endpoint ignores stream:true; yap will use its fallback path")
+                if record:
+                    try:
+                        recorded.append(json.dumps(r.json()))
+                    except ValueError:
+                        recorded.append(r.text.strip().replace("\n", " "))
+            else:
+                for line in r.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data:"):
+                        continue
+                    if record:
+                        recorded.append(line)
+                    body = line[len("data:"):].strip()
+                    if body == "[DONE]":
+                        break
+                    if first_delta_time is None:
+                        first_delta_time = time.time() - start
+                    try:
+                        chunk = json.loads(body)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get("choices") or []
+                    if choices:
+                        delta = choices[0].get("delta") or {}
+                        if delta.get("content"):
+                            print(f"{time.time()-start:.1f}s → first delta at {first_delta_time:.1f}s, "
+                                  "STREAMS INCREMENTALLY ✓")
+                            break
+                else:
+                    elapsed = time.time() - start
+                    print(f"{elapsed:.1f}s, no text deltas (server-buffered or empty response)")
+
+                # Finish line
+                if first_delta_time is None and status == 200:
+                    elapsed = time.time() - start
+                    print(f"  Elapsed: {elapsed:.1f}s, no text content in stream")
+    except requests.exceptions.ConnectionError as e:
+        print(f"Connection failed: {e}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+    # --- 4. Save fixture ---
+    if record:
+        fixture_path = Path(f"tests/fixtures/{record}.jsonl")
+        fixture_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(fixture_path, "w") as f:
+            f.write(f"# captured: {time.strftime('%Y-%m-%d %H:%M')} probing {model}\n")
+            f.write(f"# endpoint: {url}\n")
+            for line in recorded:
+                f.write(line + "\n")
+        print(f"\n▸ Recorded {len(recorded)} lines → {fixture_path}")
+
+    print()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Probe a chat-completions endpoint")
+    parser.add_argument("url", help="Base URL (e.g. http://prism:8080/v1)")
+    parser.add_argument("model", help="Model name to test")
+    parser.add_argument("--key", help="API key (or set via YAP_API_KEY env)")
+    parser.add_argument("--record", help="Record stream fixture to tests/fixtures/<name>.jsonl")
+    args = parser.parse_args()
+
+    api_key = args.key or os.environ.get("YAP_API_KEY", "")
+    probe(args.url, args.model, api_key=api_key or None, record=args.record)

@@ -1,16 +1,11 @@
 """Tests for keyboard shortcuts."""
 
-import sys
 from pathlib import Path
 
-import importlib.util
 
 root = Path(__file__).parent.parent
-sys.path.insert(0, str(root))
 
-spec = importlib.util.spec_from_file_location("yap", root / "yap.py")
-yap = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(yap)
+from yap_module import yap
 
 ChatInput = yap.ChatInput
 Yap = yap.Yap

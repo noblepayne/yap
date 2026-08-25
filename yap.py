@@ -63,6 +63,21 @@ MAX_HISTORY = int(os.environ.get("YAP_MAX_HISTORY", 50))
 MAX_PUSH_ITERATIONS = int(os.environ.get("YAP_MAX_PUSH_ITERATIONS", 10))
 
 YAP_PROVIDER = os.environ.get("YAP_PROVIDER", "anthropic")
+API_KEY = os.environ.get("YAP_API_KEY", "")
+
+
+def build_auth_headers(api_key: str | None) -> dict[str, str]:
+    """Build auth headers for the LLM endpoint.
+
+    Empty dict when no key is configured (no auth). Bearer scheme by default;
+    keys with an explicit scheme prefix (e.g. "Api-Key abc123") are passed through as-is.
+    """
+    if not api_key:
+        return {}
+    key = api_key.strip()
+    if " " in key:
+        return {"Authorization": key}
+    return {"Authorization": f"Bearer {key}"}
 
 NUDGE_MESSAGE = (
     "CONTINUE. This is iteration {iteration}. You are in a multi-step loop.\n\n"
@@ -252,9 +267,9 @@ def _unify_message(message: dict) -> dict:
             else:
                 blocks.append(block)
 
-    # Collect and unify legacy thoughts
+    # Collect and unify legacy reasoning fields
     existing_thinking = {b["thinking"] for b in blocks if b.get("type") == "thinking"}
-    for field in ["reasoning_content", "thought"]:
+    for field in ["reasoning_content", "thought", "reasoning"]:
         if field in message and message[field]:
             thought_val = _strip_ansi(str(message[field]))
             if thought_val not in existing_thinking:
@@ -394,6 +409,95 @@ def _parse_response(data: dict) -> dict:
 
     # REVISE: Unify all reasoning into content blocks (SPEC_YAP P3)
     return _unify_message(message)
+
+
+def _parse_sse_line(line: str) -> dict | None:
+    """Parse one SSE data line. Returns None for keepalives/terminators.
+
+    Accepts 'data: {...}' and bare '{...}' (some proxies omit the prefix).
+    Returns {"done": True} for the [DONE] sentinel.
+    Raises ValueError on malformed JSON payloads.
+    """
+    if not line:
+        return None
+    if line.startswith("data:"):
+        payload = line[len("data:") :].strip()
+    elif line.startswith("{"):
+        payload = line  # bare JSON, some proxies omit the prefix
+    else:
+        return None
+    if not payload:
+        return None
+    if payload == "[DONE]":
+        return {"done": True}
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Malformed SSE JSON: {e}: {payload[:120]}") from e
+
+
+def _assemble_from_chunks(chunks: list[dict]) -> tuple[dict, dict | None]:
+    """Assemble chat.completion.chunk events into (non-streaming response, usage).
+
+    Reconstructs the choices[0].message shape that _parse_response expects:
+    content as a list of blocks, plus tool_calls with complete arguments.
+    usage is the usage object from the final chunk, or None.
+    """
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: dict[int, dict] = {}  # index -> {id, name, args_str}
+    usage = None
+    finish_reason = None
+
+    for chunk in chunks:
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        if choice.get("finish_reason"):
+            finish_reason = choice["finish_reason"]
+        delta = choice.get("delta") or {}
+
+        reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning")
+        if reasoning_delta:
+            reasoning_parts.append(str(reasoning_delta))
+        if delta.get("content"):
+            text_parts.append(str(delta["content"]))
+        for tc in delta.get("tool_calls") or []:
+            idx = tc.get("index", 0)
+            slot = tool_calls.setdefault(idx, {"id": "", "name": "", "args_str": ""})
+            if tc.get("id"):
+                slot["id"] = tc["id"]
+            func = tc.get("function") or {}
+            if func.get("name"):
+                slot["name"] = func["name"]
+            if func.get("arguments"):
+                slot["args_str"] += func["arguments"]
+
+    content_blocks = []
+    if reasoning_parts:
+        content_blocks.append({"type": "thinking", "thinking": "".join(reasoning_parts)})
+    if text_parts:
+        content_blocks.append({"type": "text", "text": "".join(text_parts)})
+
+    message: dict = {"role": "assistant", "content": content_blocks}
+    if tool_calls:
+        message["tool_calls"] = [
+            {
+                "id": slot["id"] or f"call_{i}",
+                "type": "function",
+                "function": {
+                    "name": slot["name"],
+                    "arguments": slot["args_str"] or "{}",
+                },
+            }
+            for i, slot in sorted(tool_calls.items())
+        ]
+
+    response = {"choices": [{"message": message, "finish_reason": finish_reason}]}
+    return response, usage
 
 
 def _truncate_history(history: list, max_size: int) -> list:
@@ -550,8 +654,17 @@ def _http_chat(
     timeout: int,
     session: requests.Session | None = None,
     cancel_event: threading.Event | None = None,
-) -> HTTPResult:
-    """Make HTTP POST to LLM endpoint with retries."""
+    headers: dict[str, str] | None = None,
+    on_delta=None,
+) -> HTTPResult | dict:
+    """Make HTTP POST to LLM endpoint with retries.
+
+    If on_delta callback is provided, requests SSE streaming and calls
+    on_delta(text_delta) for each content chunk as it arrives. Returns
+    {"data": assembled_response, "headers": {}, "usage": usage} for streams.
+    Falls back transparently to non-streaming if the endpoint ignores
+    the stream flag (detected via Content-Type).
+    """
     s = session or requests.Session()
 
     def _should_retry(retry_state):
@@ -582,12 +695,51 @@ def _http_chat(
         sleep=_cancel_sleep,
     )
     def _do_post():
-        r = s.post(url, json=payload, timeout=timeout)
-        # Retry on 5xx server errors
+        if on_delta is None:
+            r = s.post(url, json=payload, timeout=timeout, headers=headers or {})
+            if 500 <= r.status_code < 600:
+                r.raise_for_status()
+            r.raise_for_status()
+            return HTTPResult(data=r.json(), headers=dict(r.headers))
+
+        # Streaming path
+        stream_payload = {**payload, "stream": True}
+        r = s.post(
+            url, json=stream_payload, timeout=timeout, headers=headers or {}, stream=True
+        )
         if 500 <= r.status_code < 600:
             r.raise_for_status()
         r.raise_for_status()
-        return HTTPResult(data=r.json(), headers=dict(r.headers))
+
+        content_type = r.headers.get("Content-Type", "")
+        if "text/event-stream" not in content_type:
+            # Endpoint ignored stream:true — fall back to non-streaming parse
+            data = r.json()
+            return HTTPResult(data=data, headers=dict(r.headers))
+
+        chunks = []
+        text_buffer = []
+        for raw_line in r.iter_lines(decode_unicode=True):
+            if cancel_event and cancel_event.is_set():
+                r.close()
+                raise requests.exceptions.RequestException("cancelled")
+            line = _strip_ansi(raw_line or "")
+            try:
+                event = _parse_sse_line(line)
+            except ValueError:
+                continue  # tolerate malformed lines mid-stream
+            if event is None:
+                continue
+            if event.get("done"):
+                break
+            chunks.append(event)
+            choices = event.get("choices") or []
+            if choices and choices[0].get("delta", {}).get("content"):
+                text_buffer.append(choices[0]["delta"]["content"])
+                on_delta(choices[0]["delta"]["content"])
+
+        assembled, usage = _assemble_from_chunks(chunks)
+        return {"data": assembled, "headers": dict(r.headers), "usage": usage}
 
     return _do_post()
 
@@ -963,8 +1115,20 @@ class Yap(App):
 
         # Create an HTTP session we can close to cancel in-flight requests
         session = requests.Session()
+        session.headers.update(build_auth_headers(API_KEY))
         with self._http_session_lock:
             self._http_session = session
+
+        # Streaming state: accumulated text for live display
+        stream_state = {"text": "", "last_update": 0.0}
+        UI_UPDATE_INTERVAL = 0.15  # seconds between display refreshes
+
+        def on_delta(delta_text: str) -> None:
+            stream_state["text"] += delta_text
+            now = time.time()
+            if now - stream_state["last_update"] >= UI_UPDATE_INTERVAL:
+                stream_state["last_update"] = now
+                self.call_from_thread(self._update_stream_display, stream_state["text"])
 
         def make_request():
             start_time = time.time()
@@ -1012,14 +1176,23 @@ class Yap(App):
                         )
 
                     # Make request
+                    stream_state["text"] = ""
                     result = _http_chat(
-                        API_URL, payload, TIMEOUT, session, self._push_cancelled
+                        API_URL,
+                        payload,
+                        TIMEOUT,
+                        session,
+                        self._push_cancelled,
+                        on_delta=on_delta,
                     )
                     data = result["data"]
                     obs = parse_obs(result["headers"])
                     message = _parse_response(data)
                     # Tag with current provider for stripping logic
                     message.setdefault("_meta", {})["provider"] = YAP_PROVIDER
+                    if result.get("usage"):
+                        message.setdefault("_meta", {})["usage"] = result["usage"]
+                    stream_state["text"] = ""  # clear live buffer; real message takes over
 
                     with self._history_lock:
                         self.history.append(message)
@@ -1092,11 +1265,17 @@ class Yap(App):
                             TIMEOUT,
                             session,
                             self._push_cancelled,
+                            on_delta=on_delta,
                         )
                         final_data = final_result["data"]
                         final_obs = parse_obs(final_result["headers"])
                         final_message = _parse_response(final_data)
                         final_message.setdefault("_meta", {})["provider"] = YAP_PROVIDER
+                        if final_result.get("usage"):
+                            final_message.setdefault("_meta", {})[
+                                "usage"
+                            ] = final_result["usage"]
+                        stream_state["text"] = ""
 
                         with self._history_lock:
                             self.history.append(final_message)
@@ -1260,11 +1439,35 @@ class Yap(App):
         chat_display.scroll_end(animate=False)
         self._refresh_metadata_display()
 
+    def _update_stream_display(self, text: str) -> None:
+        """Show in-progress streamed response appended after history."""
+        chat_display = self.query_one("#chat-history", TextArea)
+        base = _format_chat_display(self.history, self.show_reasoning)
+        stream_text = f"{text}\n▌"
+        chat_display.text = f"{base}\n\n[ASSISTANT · streaming]\n{stream_text}\n" + (
+            "-" * 40
+        )
+        chat_display.scroll_end(animate=False)
+
     def _refresh_context_stats(self) -> None:
         system_prompt = self.query_one("#system-prompt", TextArea).text
         chars, tokens = _count_context(system_prompt, self.history)
         stats = self.query_one("#context-stats", Static)
-        stats.update(f"Context: {chars:,} chars | ~{tokens:,} tokens")
+        # Prefer server-reported usage from the last assistant message
+        server_usage = None
+        for msg in reversed(self.history):
+            usage = (msg.get("_meta") or {}).get("usage")
+            if usage:
+                server_usage = usage
+                break
+        if server_usage:
+            stats.update(
+                f"Context: {chars:,} chars | ~{tokens:,} local | "
+                f"server: {server_usage.get('prompt_tokens', '?'):,} in / "
+                f"{server_usage.get('completion_tokens', '?'):,} out"
+            )
+        else:
+            stats.update(f"Context: {chars:,} chars | ~{tokens:,} tokens")
 
 
 if __name__ == "__main__":

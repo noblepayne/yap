@@ -1,0 +1,6 @@
+# captured: 2026-08-25 from http://100.65.102.108:8642/v1/chat/completions
+# model: hermes-agent | prompt: "Say exactly: Hello" (server-buffered: few large deltas)
+data: {"id": "chatcmpl-64a616c431b545548c0ab70026363", "object": "chat.completion.chunk", "created": 1787690656, "model": "hermes-agent", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]}
+data: {"id": "chatcmpl-64a616c431b545548c0ab70026363", "object": "chat.completion.chunk", "created": 1787690656, "model": "hermes-agent", "choices": [{"index": 0, "delta": {"content": "Hello"}, "finish_reason": null}]}
+data: {"id": "chatcmpl-64a616c431b545548c0ab70026363", "object": "chat.completion.chunk", "created": 1787690656, "model": "hermes-agent", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 18815, "completion_tokens": 30, "total_tokens": 18845}}
+data: [DONE]

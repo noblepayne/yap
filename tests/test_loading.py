@@ -1,19 +1,16 @@
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from textual.widgets import TextArea
 
-# Set up path to import yap.py
+from yap_module import yap
+
+# NOTE: This file uses patch.object on Textual widget internals. That's the
+# sanctioned use of mocks here: UI wiring is impractical to exercise against a
+# real server (see AGENTS.md — integration tests cover the HTTP path; unit
+# mocks are only for hard-to-reach failure modes).
 root = Path(__file__).parent.parent
-sys.path.insert(0, str(root))
-
-import importlib.util  # noqa: E402
-
-spec = importlib.util.spec_from_file_location("yap", root / "yap.py")
-yap = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(yap)
 
 Yap = yap.Yap
 

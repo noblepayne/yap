@@ -76,6 +76,7 @@ All via environment variables. No config files.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `YAP_API_URL` | `http://lattice:8089/v1/chat/completions` | LLM endpoint |
+| `YAP_API_KEY` | *(empty)* | Auth key. Sent as `Authorization: Bearer <key>`; if the value already contains a scheme (e.g. `Api-Key x`), it's sent as-is. Empty = no auth header. |
 | `YAP_TIMEOUT` | `3600` | Request timeout in seconds (1 hr for heavy tool use) |
 | `YAP_HISTORY_FILE` | `chat_history.jsonl` | Chat history path |
 | `YAP_LAST_RESPONSE_FILE` | `last_response.md` | Last response output |
@@ -114,6 +115,42 @@ Run: `pytest tests/`
 
 - Use `pytest`
 - Put them in `tests/`
+
+### Philosophy (how we decide what to test and how)
+
+**Integration/e2e tests are best. Tests should match how the thing is actually used.**
+If a feature is "make an HTTP call with streaming and render it", the test should
+do exactly that against a real local server — not poke internals with mocks.
+A test that exercises the real path catches protocol bugs, encoding issues,
+and wrong assumptions; a mock only verifies we called our own code.
+
+**Unit tests are for dev-ex, combinational correctness, and hard-to-reach cases.**
+Pure functions (`_assemble_from_chunks`, `_build_payload`, `parse_obs`) are cheap
+to test exhaustively — do that. Reach for unit tests when:
+- the logic has many input combinations (combinatorial),
+- failure modes are hard to trigger against a real server (malformed chunks,
+  cancel mid-stream), or
+- you want fast feedback while designing a function's shape.
+
+They are *not* a substitute for integration coverage of the imperative shell.
+
+**Generative/contract tests are super handy** — esp. with imperative-shell style
+development. When an external system has a contract (OpenAI chunk format,
+SSE framing), capture real examples from live endpoints as fixtures and replay
+them in tests. Fixtures come from reality, not from imagination; hand-invented
+payloads encode wrong assumptions (this has bitten us).
+
+### Infrastructure
+
+- `tests/conftest.py` — local threaded SSE chat-completions server fixture
+  (replays fixture JSON files; supports fault injection)
+- `tests/fixtures/*.jsonl` — captured chunk sequences from real endpoints
+  (hermes, bifrost). Record new ones with `bin/probe --record`.
+- `bin/probe` — probe a live endpoint before using it: list models, time a
+  5-token stream, report latency-to-first-delta and whether it truly streams.
+  Check assumptions first; don't guess URLs/models/timeouts.
+
+Don't mock HTTP. Spin up the local server instead.
 - Test pure functions and config in `tests/test_pure.py`
 - Don't mock HTTP - spin up a real local server if you need to test the stack
 - Test the app manually for UI changes (Textual makes this easy with `app.run_test()`)

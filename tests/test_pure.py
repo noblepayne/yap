@@ -1,14 +1,9 @@
-import sys
 from pathlib import Path
 
-import importlib.util
 
 root = Path(__file__).parent.parent
-sys.path.insert(0, str(root))  # noqa: E402
 
-spec = importlib.util.spec_from_file_location("yap", root / "yap.py")
-yap = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(yap)
+from yap_module import yap
 
 _strip_ansi = yap._strip_ansi
 _safe_write = yap._safe_write
@@ -21,6 +16,7 @@ _save_history = yap._save_history
 _load_prompt_file = yap._load_prompt_file
 _get_yap_done_tool = yap._get_yap_done_tool
 _detect_yap_done = yap._detect_yap_done
+build_auth_headers = yap.build_auth_headers
 API_URL = yap.API_URL
 TIMEOUT = yap.TIMEOUT
 MAX_HISTORY = yap.MAX_HISTORY
@@ -74,6 +70,98 @@ def test_config_defaults():
     assert "CONTINUE" in NUDGE_MESSAGE
     assert "multi-step loop" in NUDGE_MESSAGE
     assert "if work remains" in NUDGE_MESSAGE.lower()
+
+
+def test_build_auth_headers_empty():
+    """No key configured means no auth headers at all."""
+    assert build_auth_headers("") == {}
+    assert build_auth_headers(None) == {}
+
+
+def test_build_auth_headers_bearer():
+    """Bare keys get the Bearer scheme."""
+    assert build_auth_headers("sk-abc123") == {"Authorization": "Bearer sk-abc123"}
+
+
+def test_build_auth_headers_explicit_scheme():
+    """Keys with an explicit scheme pass through as-is."""
+    assert build_auth_headers("Api-Key secret") == {"Authorization": "Api-Key secret"}
+
+
+def test_build_auth_headers_strips_whitespace():
+    assert build_auth_headers("  sk-abc123  ") == {"Authorization": "Bearer sk-abc123"}
+
+
+def test_parse_sse_line_data():
+    line = 'data: {"id":"x","choices":[{"delta":{"content":"hi"}}]}'
+    event = yap._parse_sse_line(line)
+    assert event["choices"][0]["delta"]["content"] == "hi"
+
+
+def test_parse_sse_line_done():
+    assert yap._parse_sse_line("data: [DONE]") == {"done": True}
+
+
+def test_parse_sse_line_ignores_noise():
+    assert yap._parse_sse_line("") is None
+    assert yap._parse_sse_line(": keepalive comment") is None
+    assert yap._parse_sse_line("event: ping") is None
+    assert yap._parse_sse_line("data: ") is None
+
+
+def test_parse_sse_line_bare_json():
+    """Some proxies omit the 'data:' prefix."""
+    event = yap._parse_sse_line('{"choices":[]}')
+    assert event == {"choices": []}
+
+
+def test_assemble_from_chunks_text():
+    chunks = [
+        {"choices": [{"delta": {"role": "assistant"}}]},
+        {"choices": [{"delta": {"content": "Hello"}}]},
+        {"choices": [{"delta": {"content": " world"}}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": 2}},
+    ]
+    response, usage = yap._assemble_from_chunks(chunks)
+    msg = response["choices"][0]["message"]
+    assert msg["role"] == "assistant"
+    assert msg["content"] == [{"type": "text", "text": "Hello world"}]
+    assert response["choices"][0]["finish_reason"] == "stop"
+    assert usage == {"prompt_tokens": 10, "completion_tokens": 2}
+
+
+def test_assemble_from_chunks_tool_calls():
+    chunks = [
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "get", "arguments": ""}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"q":'}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '"test"}'}}]}}]},
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+    response, usage = yap._assemble_from_chunks(chunks)
+    msg = response["choices"][0]["message"]
+    tc = msg["tool_calls"][0]
+    assert tc["id"] == "call_1"
+    assert tc["function"]["name"] == "get"
+    assert tc["function"]["arguments"] == '{"q":"test"}'
+
+
+def test_assemble_from_chunks_reasoning():
+    chunks = [
+        {"choices": [{"delta": {"reasoning_content": "thinking..."}}]},
+        {"choices": [{"delta": {"content": "answer"}}]},
+    ]
+    response, _ = yap._assemble_from_chunks(chunks)
+    msg = response["choices"][0]["message"]
+    assert msg["content"][0] == {"type": "thinking", "thinking": "thinking..."}
+    assert msg["content"][1] == {"type": "text", "text": "answer"}
+
+
+def test_assemble_from_chunks_empty():
+    response, usage = yap._assemble_from_chunks([])
+    msg = response["choices"][0]["message"]
+    assert msg["role"] == "assistant"
+    assert msg["content"] == []
+    assert usage is None
 
 
 def test_estimate_tokens():
