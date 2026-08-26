@@ -36,8 +36,7 @@ from textual.widgets import (
     Header,
     Input,
     Markdown,
-    RadioButton,
-    RadioSet,
+    OptionList,
     Static,
     Switch,
     TextArea,
@@ -67,6 +66,8 @@ MAX_PUSH_ITERATIONS = int(os.environ.get("YAP_MAX_PUSH_ITERATIONS", 10))
 
 YAP_PROVIDER = os.environ.get("YAP_PROVIDER", "anthropic")
 API_KEY = os.environ.get("YAP_API_KEY", "")
+# Default model name; fetched /v1/models may refine suggestions at runtime
+YAP_MODEL = os.environ.get("YAP_MODEL", "").strip()
 
 
 def build_auth_headers(api_key: str | None) -> dict[str, str]:
@@ -116,17 +117,30 @@ logging.basicConfig(
     level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-MODEL_MAP = {
-    "model-free": "openrouter/openrouter/free",
-    "model-deepseek": "openrouter/deepseek/deepseek-v3.2",
-    "model-hunter": "openrouter/openrouter/hunter-alpha",
-    "model-healer": "openrouter/openrouter/healer-alpha",
-    "model-brian": "brian",
-    "model-custom": "custom",
-}
-
-
 # === PURE FUNCTIONS ===
+
+
+def _models_url(api_url: str) -> str:
+    """Derive the /models endpoint URL from a chat-completions URL.
+
+    http://host/v1/chat/completions -> http://host/v1/models
+    Bare hosts without the chat path degrade to {host}/models (accepted:
+    fetch 404s and the picker falls back to free text).
+    """
+    base = api_url.rsplit("/chat/completions", 1)[0].rstrip("/")
+    return f"{base}/models"
+
+
+def _filter_models(models: list[str], query: str, cap: int = 8) -> list[str]:
+    """Case-insensitive substring filter for model suggestions.
+
+    Empty query matches nothing (no 500-item dump on focus). Endpoint
+    order preserved; capped to keep the sidebar sane (bifrost serves 591).
+    """
+    if not query:
+        return []
+    q = query.lower()
+    return [m for m in models if q in m.lower()][:cap]
 
 
 def _strip_ansi(text: str) -> str:
@@ -342,8 +356,6 @@ def _build_payload(
     tools: list | None = None,
     push_mode: bool | None = None,
     extra_body: dict | None = None,
-    reasoning_effort: str | None = None,
-    include_search: bool | None = None,
 ) -> dict:
     """Build request payload."""
     parts = []
@@ -361,10 +373,6 @@ def _build_payload(
     payload = {"model": model, "messages": payload_messages}
     if tools is not None:
         payload["tools"] = tools
-    if reasoning_effort is not None:
-        payload["reasoning_effort"] = reasoning_effort
-    if include_search:
-        payload["plugins"] = [{"id": "web"}]
     if extra_body:
         payload["extra_body"] = extra_body
     return payload
@@ -905,8 +913,15 @@ class Yap(App):
         display: block;
     }
 
-    RadioButton {
-        margin: 0 1;
+    #model-suggestions {
+        display: none;
+        height: auto;
+        max-height: 12;
+        border-top: solid $panel;
+    }
+
+    #model-suggestions.visible {
+        display: block;
     }
 
     #system-prompt {
@@ -938,8 +953,6 @@ class Yap(App):
     is_loading = reactive(False)
     push_mode = reactive(False)
     debug_mode = reactive(False)
-    web_search = reactive(False)
-    reasoning_effort = reactive("low")  # default to low
     show_reasoning = reactive(True)  # default to show reasoning
 
     def __init__(self):
@@ -955,6 +968,7 @@ class Yap(App):
         # Incremental transcript tracking (see _refresh_chat_display)
         self._rendered_count = 0
         self._rendered_tail = None
+        self.available_models: list[str] = []
         logging.info(
             f"YAP_PROVIDER={YAP_PROVIDER} session_id={self.session_id} "
             f"history_file={HISTORY_FILE}"
@@ -969,27 +983,13 @@ class Yap(App):
         with Horizontal():
             with Vertical(id="config") as config_panel:
                 config_panel.border_title = "config"
-                yield Static("Model Selection:")
-                with RadioSet(id="model-select"):
-                    yield RadioButton("OpenRouter Free", value=True, id="model-free")
-                    yield RadioButton("DeepSeek v3.2", id="model-deepseek")
-                    yield RadioButton("Hunter Alpha", id="model-hunter")
-                    yield RadioButton("Healer Alpha", id="model-healer")
-                    yield RadioButton("Brian (Custom)", id="model-brian")
-                    yield RadioButton("Custom Model", id="model-custom")
-                yield Static("Custom Model Name:")
+                yield Static("Model:")
                 yield Input(
-                    placeholder="org/model...", id="custom-model", disabled=True
+                    placeholder="model name…", id="model-input"
                 )
+                yield OptionList(id="model-suggestions")
                 yield Static("System Prompt:")
                 yield TextArea(id="system-prompt")
-                yield Static("Web Search:")
-                yield Switch(id="web-search", value=False)
-                yield Static("Reasoning Effort:")
-                with RadioSet(id="reasoning-effort"):
-                    yield RadioButton("Low", value=True, id="reasoning-low")
-                    yield RadioButton("Medium", id="reasoning-medium")
-                    yield RadioButton("High", id="reasoning-high")
                 yield Static("Show Reasoning:")
                 yield Switch(id="show-reasoning", value=True)
                 yield Button("Load Prompt", id="load-prompt", variant="primary")
@@ -1015,6 +1015,11 @@ class Yap(App):
 
     def on_mount(self) -> None:
         self.theme = os.environ.get("YAP_THEME", "nord")
+        # Prefill from env immediately; fetched sole-model refines later
+        # only if the user hasn't typed (see _set_models guard).
+        if YAP_MODEL:
+            self.query_one("#model-input", Input).value = YAP_MODEL
+        threading.Thread(target=self._fetch_models, daemon=True).start()
         self._refresh_chat_display()
         self._refresh_context_stats()
         self._update_status_text("Ready")
@@ -1030,11 +1035,51 @@ class Yap(App):
             except Exception as e:
                 logging.error(f"Failed to prepare history for save: {e}")
 
-    @on(RadioSet.Changed)
-    def _on_model_changed(self, event: RadioSet.Changed) -> None:
-        custom_input = self.query_one("#custom-model", Input)
-        selected = self._get_selected_model()
-        custom_input.disabled = selected != "custom"
+    def _fetch_models(self) -> None:
+        """Background fetch of /v1/models. Silent degrade on any failure —
+        endpoints without the route just leave suggestions empty."""
+        try:
+            base = _models_url(API_URL)
+            r = requests.get(base, headers=build_auth_headers(API_KEY), timeout=10)
+            if r.status_code == 200:
+                ids = [m["id"] for m in r.json().get("data", []) if m.get("id")]
+                self.call_from_thread(self._set_models, ids)
+        except Exception as e:
+            # Includes loop-shutdown races in tests: prefill missed = fine
+            logging.info(f"Model list fetch skipped/failed (free-text works): {e}")
+
+    def _set_models(self, models: list[str]) -> None:
+        """UI-thread: store fetched models and prefill per precedence.
+
+        Prefill guard: never clobber a model the user already typed.
+        """
+        self.available_models = models
+        model_input = self.query_one("#model-input", Input)
+        if not model_input.value.strip():
+            if YAP_MODEL:
+                model_input.value = YAP_MODEL
+            elif len(models) == 1:
+                model_input.value = models[0]
+
+    @on(Input.Changed, "#model-input")
+    def _on_model_input_changed(self, event: Input.Changed) -> None:
+        matches = _filter_models(self.available_models, event.value.strip())
+        suggestions = self.query_one("#model-suggestions", OptionList)
+        if matches:
+            suggestions.set_options(matches)
+            suggestions.add_class("visible")
+        else:
+            suggestions.clear_options()
+            suggestions.remove_class("visible")
+
+    @on(OptionList.OptionSelected, "#model-suggestions")
+    def _on_model_suggestion_selected(
+        self, event: OptionList.OptionSelected
+    ) -> None:
+        self.query_one("#model-input", Input).value = str(event.option.prompt)
+        suggestions = self.query_one("#model-suggestions", OptionList)
+        suggestions.clear_options()
+        suggestions.remove_class("visible")
 
     @on(Button.Pressed, "#load-prompt")
     def _on_load_prompt(self, event: Button.Pressed) -> None:
@@ -1047,20 +1092,6 @@ class Yap(App):
     @on(Button.Pressed, "#push-mode-toggle")
     def _on_push_mode_toggle(self, event: Button.Pressed) -> None:
         self.action_toggle_push()
-
-    @on(Switch.Changed, "#web-search")
-    def _on_web_search_changed(self, event: Switch.Changed) -> None:
-        self.web_search = event.value
-
-    @on(RadioSet.Changed, "#reasoning-effort")
-    def _on_reasoning_effort_changed(self, event: RadioSet.Changed) -> None:
-        if event.pressed:
-            if event.pressed.id == "reasoning-low":
-                self.reasoning_effort = "low"
-            elif event.pressed.id == "reasoning-medium":
-                self.reasoning_effort = "medium"
-            elif event.pressed.id == "reasoning-high":
-                self.reasoning_effort = "high"
 
     @on(Switch.Changed, "#show-reasoning")
     def _on_show_reasoning_changed(self, event: Switch.Changed) -> None:
@@ -1076,16 +1107,6 @@ class Yap(App):
             status.add_class("loading")
         else:
             status.remove_class("loading")
-
-    def _get_selected_model(self) -> str | None:
-        try:
-            radio_set = self.query_one("#model-select", RadioSet)
-            pressed = radio_set.pressed_button
-            if pressed and pressed.id in MODEL_MAP:
-                return MODEL_MAP[pressed.id]
-        except Exception:
-            pass
-        return None
 
     def update_status(self, text: str, status_type: str = "normal") -> None:
         self.call_from_thread(self._update_status_text, text, status_type)
@@ -1143,18 +1164,10 @@ class Yap(App):
         if self.is_loading:
             return
 
-        selected = self._get_selected_model()
-        if not selected:
-            self._update_status_text("Error: Select a valid model", "error")
+        model = self.query_one("#model-input", Input).value.strip()
+        if not model:
+            self._update_status_text("Error: Enter a model name", "error")
             return
-
-        if selected == "custom":
-            model = self.query_one("#custom-model", Input).value.strip()
-            if not model:
-                self._update_status_text("Error: Enter custom model name", "error")
-                return
-        else:
-            model = selected
 
         user_input = self.query_one("#user-input", ChatInput)
         user_text = user_input.text.strip()
@@ -1231,8 +1244,6 @@ class Yap(App):
                         extra_body={
                             "session-id": self.session_id
                         },  # Hyphen for injector compatibility
-                        reasoning_effort=self.reasoning_effort,
-                        include_search=self.web_search,
                     )
 
                     # Update status for push mode

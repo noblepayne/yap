@@ -492,27 +492,11 @@ def test_build_payload_with_system_and_push_mode():
     assert system_content.index("Push Mode") < system_content.index("You are helpful")
 
 
-def test_build_payload_with_reasoning_effort():
-    payload = _build_payload(
-        "gpt-4", [{"role": "user", "content": "hi"}], reasoning_effort="low"
-    )
-    assert payload["reasoning_effort"] == "low"
-
-
-def test_build_payload_with_include_search():
-    payload = _build_payload(
-        "gpt-4", [{"role": "user", "content": "hi"}], include_search=True
-    )
-    assert payload["plugins"] == [{"id": "web"}]
-
-
-def test_build_payload_with_all_new_options():
+def test_build_payload_basic_options():
     payload = _build_payload(
         "gpt-4",
         [{"role": "user", "content": "hi"}],
         system_prompt="test",
-        reasoning_effort="high",
-        include_search=False,
     )
     assert payload["model"] == "gpt-4"
     assert len(payload["messages"]) == 2  # system + user message
@@ -520,8 +504,35 @@ def test_build_payload_with_all_new_options():
     assert payload["messages"][0]["content"] == "test"
     assert payload["messages"][1]["role"] == "user"
     assert payload["messages"][1]["content"] == "hi"
-    assert payload["reasoning_effort"] == "high"
-    assert "plugins" not in payload
+
+
+def test_models_url_derivation():
+    assert (
+        yap._models_url("http://host:8080/v1/chat/completions")
+        == "http://host:8080/v1/models"
+    )
+    # Trailing slash tolerated
+    assert yap._models_url("http://host/v1/chat/completions/") == "http://host/v1/models"
+    # Bare host degrades (fetch will 404; picker falls back to free text)
+    assert yap._models_url("http://host:8089") == "http://host:8089/models"
+
+
+def test_filter_models():
+    models = ["groq/llama-3", "Groq/GPT-OSS-120b", "hermes-agent", "openai/gpt-4"]
+    # Empty query matches nothing — no giant dump on focus
+    assert yap._filter_models(models, "") == []
+    # Case-insensitive substring
+    assert yap._filter_models(models, "GPT") == ["Groq/GPT-OSS-120b", "openai/gpt-4"]
+    assert yap._filter_models(models, "hermes") == ["hermes-agent"]
+    # Order preserved from endpoint
+    assert yap._filter_models(models, "o") == [
+        "groq/llama-3",
+        "Groq/GPT-OSS-120b",
+        "openai/gpt-4",
+    ]
+    # Capped
+    many = [f"m{i}" for i in range(20)]
+    assert len(yap._filter_models(many, "m")) == 8
 
 
 def test_build_payload_push_mode_none_no_disclosure():

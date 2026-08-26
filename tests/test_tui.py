@@ -262,6 +262,132 @@ def test_ctrl_g_binding_present():
     assert any(b[0] == "ctrl+g" and b[1] == "toggle_config" for b in yap.Yap.BINDINGS)
 
 
+# --- Dynamic model picker ---
+
+
+def test_models_fetch_populates_suggestions(tmp_path, monkeypatch):
+    """Fetched /v1/models feed the suggestion list over real HTTP."""
+    async def scenario():
+        server = ChatServer(models=["hermes-agent", "groq/gpt-oss-120b"]).start()
+        try:
+            monkeypatch.setattr(yap, "API_URL", server.url)
+            monkeypatch.setattr(yap, "HISTORY_FILE", tmp_path / "h.jsonl")
+            monkeypatch.setattr(yap, "LAST_RESPONSE_FILE", tmp_path / "l.md")
+
+            app = yap.Yap()
+            async with app.run_test() as pilot:
+                inp = app.query_one("#model-input", yap.Input)
+                deadline = time.time() + 5
+                while time.time() < deadline and not app.available_models:
+                    await pilot.pause(0.05)
+                assert app.available_models == ["hermes-agent", "groq/gpt-oss-120b"]
+
+                inp.value = "gpt"
+                await pilot.pause()
+                suggestions = app.query_one("#model-suggestions", yap.OptionList)
+                assert suggestions.has_class("visible")
+                assert suggestions.option_count == 1
+                # Let the fetch thread unwind before loop teardown
+                await asyncio.sleep(0.05)
+        finally:
+            server.stop()
+
+    _sync(scenario())
+
+
+def test_sole_model_autoprefills_and_guard_holds(tmp_path, monkeypatch):
+    """Single-model endpoints prefill; a user-typed model is never clobbered."""
+    async def scenario():
+        server = ChatServer(models=["hermes-agent"]).start()
+        try:
+            monkeypatch.setattr(yap, "API_URL", server.url)
+            monkeypatch.setattr(yap, "HISTORY_FILE", tmp_path / "h.jsonl")
+            monkeypatch.setattr(yap, "LAST_RESPONSE_FILE", tmp_path / "l.md")
+
+            app = yap.Yap()
+            async with app.run_test() as pilot:
+                inp = app.query_one("#model-input", yap.Input)
+                deadline = time.time() + 5
+                while time.time() < deadline and not inp.value:
+                    await pilot.pause(0.05)
+                assert inp.value == "hermes-agent"
+                await asyncio.sleep(0.05)  # fetch thread unwind
+
+                # Guard: user typing before/during fetch arrival survives.
+                # pause() flushes the Input.Changed handler while mounted —
+                # otherwise it fires post-unmount and explodes at loop close.
+                inp.value = "my-custom-model"
+                await pilot.pause()
+                app._set_models(["other-model"])
+                assert inp.value == "my-custom-model"
+        finally:
+            server.stop()
+
+    _sync(scenario())
+
+
+def test_yap_model_env_wins_over_fetch_prefill(tmp_path, monkeypatch):
+    """YAP_MODEL beats sole-model prefill. Module-global patch, NOT setenv —
+    yap reads it at import time (same discipline as API_URL)."""
+    async def scenario():
+        server = ChatServer(models=["hermes-agent"]).start()
+        try:
+            monkeypatch.setattr(yap, "API_URL", server.url)
+            monkeypatch.setattr(yap, "YAP_MODEL", "pinned/model")
+            monkeypatch.setattr(yap, "HISTORY_FILE", tmp_path / "h.jsonl")
+            monkeypatch.setattr(yap, "LAST_RESPONSE_FILE", tmp_path / "l.md")
+
+            app = yap.Yap()
+            async with app.run_test() as pilot:
+                inp = app.query_one("#model-input", yap.Input)
+                assert inp.value == "pinned/model"
+                deadline = time.time() + 5
+                while time.time() < deadline and not app.available_models:
+                    await pilot.pause(0.05)
+                # Fetch landed but env prefill stands
+                assert inp.value == "pinned/model"
+        finally:
+            server.stop()
+
+    _sync(scenario())
+
+
+def test_models_endpoint_missing_degrades(tmp_path, monkeypatch):
+    """No /v1/models route → picker still works free-text, send succeeds."""
+    async def scenario():
+        server = ChatServer(chunks=make_chunks("works"), models=None).start()  # models=None → 404
+        try:
+            monkeypatch.setattr(yap, "API_URL", server.url)
+            monkeypatch.setattr(yap, "HISTORY_FILE", tmp_path / "h.jsonl")
+            monkeypatch.setattr(yap, "LAST_RESPONSE_FILE", tmp_path / "l.md")
+
+            app = yap.Yap()
+            async with app.run_test() as pilot:
+                await pilot.pause(0.2)  # give the doomed fetch a moment
+                assert app.available_models == []
+                inp = app.query_one("#user-input", yap.ChatInput)
+                model_input = app.query_one("#model-input", yap.Input)
+                model_input.value = "whatever-model"
+                inp.text = "ping"
+                app.action_send()
+
+                deadline = time.time() + 15
+                while time.time() < deadline:
+                    await pilot.pause(0.05)
+                    if len(server.requests) == 1 and not app.is_loading:
+                        break
+                assert len(server.requests) == 1
+                sent = server.requests[0]
+                assert sent["model"] == "whatever-model"
+                # Removal pinned: cut payload keys must stay gone
+                assert "reasoning_effort" not in sent
+                assert "plugins" not in sent
+        finally:
+            server.stop()
+
+    _sync(scenario())
+
+
 # --- Full loop e2e ---
 
 
@@ -282,6 +408,8 @@ def test_full_send_stream_render(tmp_path, monkeypatch):
             async with app.run_test() as pilot:
                 await pilot.pause()
                 inp = app.query_one("#user-input", yap.ChatInput)
+                model_input = app.query_one("#model-input", yap.Input)
+                model_input.value = "test-model"
                 inp.text = "hello server"
                 app.action_send()
 
@@ -292,6 +420,8 @@ def test_full_send_stream_render(tmp_path, monkeypatch):
                         break
                 assert len(server.requests) == 1, "action_send never sent a request"
                 assert not app.is_loading, "request never completed"
+                # Wire contract: the typed model name goes out verbatim
+                assert server.requests[0]["model"] == "test-model"
 
                 msg = app.history[-1]
                 assert msg["role"] == "assistant"

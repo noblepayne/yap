@@ -82,6 +82,7 @@ All via environment variables. No config files.
 | `YAP_LAST_RESPONSE_FILE` | `last_response.md` | Last response output |
 | `YAP_MAX_HISTORY` | `50` | Max messages to keep |
 | `YAP_MAX_PUSH_ITERATIONS` | `10` | Max iterations in push mode |
+| `YAP_MODEL` | *(empty)* | Default model name; prefilled into the picker (fetched `/v1/models` refines suggestions; sole-model endpoints autofill when unset) |
 | `YAP_THEME` | `nord` | Textual theme name (any builtin: tokyo-night, gruvbox, dracula, ...) |
 
 ---

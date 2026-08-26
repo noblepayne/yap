@@ -31,11 +31,12 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 class ChatServer:
     """Configurable fake chat-completions endpoint."""
 
-    def __init__(self, chunks=None, require_auth=None, json_body=None, script=None):
+    def __init__(self, chunks=None, require_auth=None, json_body=None, script=None, models=None):
         self.chunks = chunks or []
         self.require_auth = require_auth
         self.json_body = json_body  # dict: served verbatim regardless of stream flag
         self.script = list(script) if script else None  # chunk-list per request
+        self.models = models  # list[str] served at /v1/models; None => 404 (degrade path)
         self._script_pos = 0
         self._script_lock = threading.Lock()
         self.requests = []  # recorded request bodies for assertions
@@ -102,6 +103,28 @@ class ChatServer:
 
             def log_message(self, *args):
                 pass
+
+            def do_GET(self):
+                # Same auth gate as POST: real gateways protect /models too.
+                if server.require_auth and (
+                    self.headers.get("Authorization") != server.require_auth
+                ):
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                path = self.path.split("?")[0]
+                if path == "/v1/models" and server.models is not None:
+                    body = json.dumps(
+                        {"data": [{"id": m} for m in server.models]}
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404)
+                self.end_headers()
 
             def do_POST(self):
                 try:
