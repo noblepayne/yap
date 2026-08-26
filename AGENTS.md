@@ -178,6 +178,56 @@ Don't mock HTTP. Spin up the local server instead.
 
 ---
 
+## Process Patterns
+
+Patterns that earned their keep here. Reach for them when work is bigger
+than a one-liner.
+
+### Audit Council
+
+For reviewing a chunk of finished work (tests, refactor, feature):
+
+1. Run TWO independent reviewers with different lenses:
+   - **small picture** — function correctness, edge cases, naming, dead code,
+     assertion quality ("does this test actually test what its name says?")
+   - **big picture** — architecture fit, production concerns, philosophy
+     alignment, bar-raising gaps
+2. You are the council that integrates: **validate every finding against the
+   real code before acting.** Auditors get details wrong — file counts,
+   timings, whether a thing exists at all. Accept what survives checking,
+   reject what doesn't, and say why. Rejections are fine; proportionality
+   beats completeness ("no drama" applies to review too).
+
+### Plan → Review → Execute
+
+For changes with real design surface (new abstractions, signatures, protocols):
+
+1. Write the plan down first, including the proposed API/signature.
+2. Get an independent review of the **plan**, not the code. Ask pointedly:
+   what breaks, what's missing, is there a simpler shape?
+3. Integrate corrections, then execute.
+
+A plan review once rejected a proposed return-signature (it would have
+silently killed streaming fidelity) AND surfaced a latent bug before any
+code existed. Reviews can reject designs, not just bless them — let them.
+
+### Fix Bug Classes, Not Instances
+
+Same bug bites twice? Stop patching and restructure so the whole class is
+impossible. (Bitten twice by `self`-vs-closure confusion inside a nested
+HTTP handler → moved all decisions into a plain method where `self` means
+exactly one thing, and unit-tested it without sockets.)
+
+### Keep Invariants While Refactoring
+
+A refactor must preserve properties tests depend on, not just the final
+pass/fail outcome. A test can pass for the *wrong reason* after a bad
+refactor (e.g. cancel-mid-stream passing because everything arrived at
+once). Know which property each test pins — streaming fidelity, wire
+content, exit codes — and keep it green *and* meaningful.
+
+---
+
 ## What This Project Is Not
 
 - A framework
