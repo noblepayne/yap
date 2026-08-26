@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          # Avoid GitHub API rate limits while nix fetches inputs
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Exact dev-environment parity: same shell, same deps, same pytest.
+      # Runtime deps come via uv sync into .venv; the venv interpreter is
+      # used explicitly so the nix-provided pytest can't shadow it.
+      - name: Run tests
+        run: nix develop -c sh -c 'uv sync --quiet && .venv/bin/python -m pytest tests/ -q'
