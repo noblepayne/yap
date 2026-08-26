@@ -7,9 +7,11 @@ No async pytest plugin — scenarios run through asyncio.run.
 """
 
 import asyncio
+import time
 
 from textual.widgets import Markdown, RichLog
 
+from helpers import ChatServer, make_chunks
 from yap_module import yap
 
 
@@ -100,5 +102,52 @@ def test_copy_transcript_includes_both_roles():
             app.action_copy_transcript()
         assert len(copied) == 1
         assert "[USER]" in copied[0] and "[ASSISTANT]" in copied[0]
+
+    asyncio.run(scenario())
+
+
+def test_full_send_stream_render(tmp_path, monkeypatch):
+    """E2E: input -> action_send -> real HTTP stream -> history + RichLog.
+
+    The complete user-visible loop against the local ChatServer. Final
+    state only — no mid-stream timing assertions.
+    """
+    async def scenario():
+        server = ChatServer(chunks=make_chunks("E2E reply")).start()
+        try:
+            # Patch BEFORE Yap() construction: __init__ reads HISTORY_FILE
+            monkeypatch.setattr(yap, "API_URL", server.url)
+            monkeypatch.setattr(yap, "HISTORY_FILE", tmp_path / "history.jsonl")
+            monkeypatch.setattr(yap, "LAST_RESPONSE_FILE", tmp_path / "last.md")
+
+            app = yap.Yap()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                inp = app.query_one("#user-input", yap.ChatInput)
+                inp.text = "hello server"
+                app.action_send()
+
+                deadline = time.time() + 15
+                while time.time() < deadline:
+                    await pilot.pause(0.05)
+                    if len(server.requests) == 1 and not app.is_loading:
+                        break
+                # Diagnose silent-no-send in ms, not at the 15s deadline
+                assert len(server.requests) == 1, "action_send never sent a request"
+                assert not app.is_loading, "request never completed"
+
+                msg = app.history[-1]
+                assert msg["role"] == "assistant"
+                text = "".join(
+                    b.get("text", "") for b in msg["content"] if b.get("type") == "text"
+                )
+                assert text == "E2E reply"
+
+                log = app.query_one("#chat-history", RichLog)
+                rendered = "\n".join(strip.text for strip in log.lines)
+                normalized = " ".join(rendered.split())
+                assert "E2E reply" in normalized
+        finally:
+            server.stop()
 
     asyncio.run(scenario())

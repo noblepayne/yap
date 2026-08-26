@@ -1,442 +1,156 @@
-"""Integration tests for push mode with real HTTP server."""
+"""Integration tests for push mode building blocks over real HTTP.
 
-import json
+Uses the shared ChatServer (helpers.py) in scripted mode — one response
+per request, last entry repeats. These tests exercise the pieces the push
+loop is built from (_build_payload, _http_chat, _parse_response,
+_detect_yap_done, NUDGE_MESSAGE). The full TUI loop is covered in
+test_tui.py.
+"""
+
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from pathlib import Path
-
 
 import pytest
+import requests
 
-# Add project root to path
-root = Path(__file__).parent.parent
-
+from helpers import ChatServer, make_chunks, make_toolcall_chunks
 from yap_module import yap
 
-
-class MockLLMHandler(BaseHTTPRequestHandler):
-    """HTTP handler that mimics LLM API responses."""
-
-    def do_POST(self):
-        if self.path != "/v1/chat/completions":
-            self.send_response(404)
-            self.end_headers()
-            return
-
-        # Read request body
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        request = json.loads(body)
-
-        # Get the test scenario from the server
-        scenario = self.server.scenario
-
-        # Build response based on scenario
-        response = self._build_response(request, scenario)
-
-        # Send response
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(response).encode())
-
-    def _build_response(self, request, scenario):
-        messages = request.get("messages", [])
-        iteration = len([m for m in messages if m.get("role") == "assistant"])
-
-        if scenario == "done_on_first":
-            # Call yap__done on first iteration
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": "call_1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "yap__done",
-                                        "arguments": '{"summary": "Task completed"}',
-                                    },
-                                }
-                            ],
-                        },
-                        "finish_reason": "tool_calls",
-                    }
-                ]
-            }
-        elif scenario == "nudge_then_done":
-            # First iteration: no tool call, second: call yap__done
-            if iteration == 0:
-                return {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": "Let me think about this...",
-                                "tool_calls": [
-                                    {
-                                        "id": "call_1",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "other_tool",
-                                            "arguments": "{}",
-                                        },
-                                    }
-                                ],
-                            },
-                            "finish_reason": "tool_calls",
-                        }
-                    ]
-                }
-            else:
-                # Second iteration: call yap__done
-                return {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": "Done!",
-                                "tool_calls": [
-                                    {
-                                        "id": "call_2",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "yap__done",
-                                            "arguments": '{"summary": "Completed after nudge"}',
-                                        },
-                                    }
-                                ],
-                            },
-                            "finish_reason": "tool_calls",
-                        }
-                    ]
-                }
-        elif scenario == "max_iterations":
-            # Never call yap__done, just return text
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": f"Thinking... iteration {iteration}",
-                            "tool_calls": [],
-                        },
-                        "finish_reason": "stop",
-                    }
-                ]
-            }
-        elif scenario == "error_on_second":
-            # First iteration succeeds, second returns error
-            if iteration == 0:
-                return {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": "First response",
-                                "tool_calls": [],
-                            },
-                            "finish_reason": "stop",
-                        }
-                    ]
-                }
-            else:
-                # Return invalid JSON to simulate error
-                self.send_response(500)
-                self.end_headers()
-                return None
-        elif scenario == "always_502":
-            # Always return 502 to trigger retry backoff
-            self.send_response(502)
-            self.end_headers()
-            return None
-        else:
-            # Default: call yap__done
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "Done!",
-                            "tool_calls": [
-                                {
-                                    "id": "call_1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "yap__done",
-                                        "arguments": '{"summary": "Default done"}',
-                                    },
-                                }
-                            ],
-                        },
-                        "finish_reason": "tool_calls",
-                    }
-                ]
-            }
-
-    def log_message(self, format, *args):
-        """Suppress log messages."""
-        pass
+DONE_CALL = {"id": "call_1", "name": "yap__done", "arguments": '{"summary": "Task completed"}'}
+OTHER_CALL = {"id": "call_1", "name": "other_tool", "arguments": "{}"}
 
 
 @pytest.fixture
-def mock_llm_server():
-    """Create a mock LLM server for testing."""
-    server = HTTPServer(("localhost", 0), MockLLMHandler)
-    server.scenario = "done_on_first"
-    port = server.server_address[1]
-
-    # Start server in background thread
-    server_thread = threading.Thread(target=server.serve_forever)
-    server_thread.daemon = True
-    server_thread.start()
-
-    # Yield server info
-    yield server, port
-
-    # Cleanup
-    server.shutdown()
-    server_thread.join(timeout=1)
+def server(monkeypatch):
+    """ChatServer with yap.API_URL pointed at it (auto-restored)."""
+    s = ChatServer(script=[[]]).start()
+    monkeypatch.setattr(yap, "API_URL", s.url)
+    yield s
+    s.stop()
 
 
-def test_push_mode_done_on_first(mock_llm_server):
-    """Test that push mode exits when yap__done is called on first iteration."""
-    server, port = mock_llm_server
-    server.scenario = "done_on_first"
-
-    # Temporarily override API_URL
-    original_url = yap.API_URL
-    yap.API_URL = f"http://localhost:{port}/v1/chat/completions"
-
-    try:
-        # Create app instance
-        app = yap.Yap()
-        app.push_mode = True
-
-        # Simulate sending a message
-        # Note: We can't easily test the full TUI loop here, but we can test
-        # the HTTP interaction directly
-        payload = yap._build_payload(
-            "test-model",
-            [{"role": "user", "content": "test message"}],
-            None,
-            [yap._get_yap_done_tool()],
-        )
-
-        data = yap._http_chat(yap.API_URL, payload, 5)
-        message = yap._parse_response(data["data"])
-
-        # Verify the response
-        assert message.get("tool_calls") is not None
-        assert yap._detect_yap_done(message["tool_calls"])
-    finally:
-        yap.API_URL = original_url
+def _payload(history):
+    return yap._build_payload(
+        "test-model", history, None, [yap._get_yap_done_tool()]
+    )
 
 
-def test_push_mode_nudge_then_done(mock_llm_server):
-    """Test that push mode adds nudge and continues when not done."""
-    server, port = mock_llm_server
-    server.scenario = "nudge_then_done"
-
-    original_url = yap.API_URL
-    yap.API_URL = f"http://localhost:{port}/v1/chat/completions"
-
-    try:
-        payload = yap._build_payload(
-            "test-model",
-            [{"role": "user", "content": "test message"}],
-            None,
-            [yap._get_yap_done_tool()],
-        )
-
-        # First request
-        data = yap._http_chat(yap.API_URL, payload, 5)
-        message = yap._parse_response(data["data"])
-        assert not yap._detect_yap_done(message.get("tool_calls"))
-
-        # Add nudge
-        history = [{"role": "user", "content": "test message"}]
-        history.append(message)
-        history.append({"role": "user", "content": yap.NUDGE_MESSAGE})
-
-        # Second request
-        payload = yap._build_payload(
-            "test-model", history, None, [yap._get_yap_done_tool()]
-        )
-        data = yap._http_chat(yap.API_URL, payload, 5)
-        message = yap._parse_response(data["data"])
-
-        # Second request should call yap__done
-        assert yap._detect_yap_done(message.get("tool_calls"))
-    finally:
-        yap.API_URL = original_url
+def test_push_mode_done_on_first(server):
+    """yap__done tool call round-trips and is detected."""
+    server.script = [make_toolcall_chunks([DONE_CALL])]
+    data = yap._http_chat(yap.API_URL, _payload([{"role": "user", "content": "go"}]), 5)
+    message = yap._parse_response(data["data"])
+    assert message.get("tool_calls") is not None
+    assert yap._detect_yap_done(message["tool_calls"])
 
 
-def test_push_mode_max_iterations(mock_llm_server):
-    """Test that push mode respects max iterations limit."""
-    server, port = mock_llm_server
-    server.scenario = "max_iterations"
+def test_push_mode_nudge_then_done(server):
+    """Non-done call → nudge appended → second round calls yap__done.
 
-    original_url = yap.API_URL
-    original_max = yap.MAX_PUSH_ITERATIONS
-    yap.API_URL = f"http://localhost:{port}/v1/chat/completions"
-    yap.MAX_PUSH_ITERATIONS = 3  # Low limit for testing
+    Also verifies the nudge actually reaches the wire: request 2 must
+    contain NUDGE_MESSAGE as a user message.
+    """
+    server.script = [
+        make_toolcall_chunks([OTHER_CALL], content="Let me think about this..."),
+        make_toolcall_chunks([DONE_CALL], content="Done!"),
+    ]
+    history = [{"role": "user", "content": "test message"}]
 
-    try:
-        history = [{"role": "user", "content": "test message"}]
-        iteration = 0
+    data = yap._http_chat(yap.API_URL, _payload(history), 5)
+    message = yap._parse_response(data["data"])
+    assert not yap._detect_yap_done(message.get("tool_calls"))
 
-        while iteration < yap.MAX_PUSH_ITERATIONS:
-            payload = yap._build_payload(
-                "test-model", history, None, [yap._get_yap_done_tool()]
-            )
-            data = yap._http_chat(yap.API_URL, payload, 5)
-            message = yap._parse_response(data["data"])
+    history.append(message)
+    history.append({"role": "user", "content": yap.NUDGE_MESSAGE})
 
-            if yap._detect_yap_done(message.get("tool_calls")):
-                break
+    data = yap._http_chat(yap.API_URL, _payload(history), 5)
+    message = yap._parse_response(data["data"])
+    assert yap._detect_yap_done(message["tool_calls"])
 
-            # Add nudge and continue
-            history.append(message)
-            history.append({"role": "user", "content": yap.NUDGE_MESSAGE})
-            iteration += 1
-
-        # Should have stopped at max iterations
-        assert iteration == yap.MAX_PUSH_ITERATIONS
-    finally:
-        yap.API_URL = original_url
-        yap.MAX_PUSH_ITERATIONS = original_max
+    # Contract: the nudge went out on the wire
+    sent_messages = server.requests[1]["messages"]
+    assert any(
+        m.get("role") == "user" and m.get("content") == yap.NUDGE_MESSAGE
+        for m in sent_messages
+    ), f"NUDGE_MESSAGE missing from second request: {sent_messages}"
 
 
-def test_push_mode_error_handling(mock_llm_server):
-    """Test that push mode handles errors gracefully."""
-    server, port = mock_llm_server
-    server.scenario = "error_on_second"
+def test_push_mode_max_iterations(server, monkeypatch):
+    """Loop stops at MAX_PUSH_ITERATIONS when model never calls yap__done."""
+    monkeypatch.setattr(yap, "MAX_PUSH_ITERATIONS", 3)
+    server.script = [make_chunks("Thinking...")]  # repeats forever
 
-    original_url = yap.API_URL
-    yap.API_URL = f"http://localhost:{port}/v1/chat/completions"
-
-    try:
-        history = [{"role": "user", "content": "test message"}]
-
-        # First request should succeed
-        payload = yap._build_payload(
-            "test-model", history, None, [yap._get_yap_done_tool()]
-        )
-        data = yap._http_chat(yap.API_URL, payload, 5)
-        message = yap._parse_response(data["data"])
-        # Content is unified into blocks
-        assert message["content"][0]["text"] == "First response"
-
-        # Add nudge
-        history.append(message)
-        history.append({"role": "user", "content": yap.NUDGE_MESSAGE})
-
-        # Second request should fail
-        payload = yap._build_payload(
-            "test-model", history, None, [yap._get_yap_done_tool()]
-        )
-        with pytest.raises(Exception):
-            yap._http_chat(yap.API_URL, payload, 5)
-    finally:
-        yap.API_URL = original_url
-
-
-def test_push_mode_cancel_event():
-    """Test that cancel event stops the push loop."""
-    # Create a cancel event
-    cancel_event = threading.Event()
-
-    # Simulate a loop that checks the event
+    history = [{"role": "user", "content": "test message"}]
     iteration = 0
-    max_iterations = 10
-
-    def cancel_after_delay():
-        time.sleep(0.1)
-        cancel_event.set()
-
-    # Start cancel thread
-    cancel_thread = threading.Thread(target=cancel_after_delay)
-    cancel_thread.start()
-
-    # Simulate push loop
-    while iteration < max_iterations and not cancel_event.is_set():
-        time.sleep(0.05)
+    while iteration < yap.MAX_PUSH_ITERATIONS:
+        data = yap._http_chat(yap.API_URL, _payload(history), 5)
+        message = yap._parse_response(data["data"])
+        if yap._detect_yap_done(message.get("tool_calls")):
+            break
+        history.append(message)
+        history.append({"role": "user", "content": yap.NUDGE_MESSAGE})
         iteration += 1
 
-    cancel_thread.join()
+    assert iteration == yap.MAX_PUSH_ITERATIONS
 
-    # Should have cancelled before max iterations
-    assert iteration < max_iterations
-    assert cancel_event.is_set()
+
+def test_push_mode_error_handling(server):
+    """Success then HTTP 500 — retries exhaust and raise (~16s of backoff).
+
+    Intentionally slow: validates real retry-exhaustion behavior.
+    """
+    server.script = [
+        make_chunks("First response"),
+        [{"status": 500}],
+    ]
+    history = [{"role": "user", "content": "test message"}]
+
+    data = yap._http_chat(yap.API_URL, _payload(history), 5)
+    message = yap._parse_response(data["data"])
+    assert message["content"][0]["text"] == "First response"
+
+    history.append(message)
+    history.append({"role": "user", "content": yap.NUDGE_MESSAGE})
+
+    with pytest.raises(requests.exceptions.RequestException):
+        yap._http_chat(yap.API_URL, _payload(history), 5)
 
 
 def test_push_mode_detect_yap_done():
-    """Test the _detect_yap_done helper function."""
-    # Test with yap__done call
-    tool_calls = [
-        {
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "yap__done", "arguments": '{"summary": "done"}'},
-        }
-    ]
-    assert yap._detect_yap_done(tool_calls) is True
-
-    # Test without yap__done
-    tool_calls = [
-        {
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "other_tool", "arguments": "{}"},
-        }
-    ]
-    assert yap._detect_yap_done(tool_calls) is False
-
-    # Test with empty list
+    """Pure: _detect_yap_done truth table."""
+    done = [{"id": "c1", "type": "function",
+             "function": {"name": "yap__done", "arguments": '{"summary": "done"}'}}]
+    other = [{"id": "c1", "type": "function",
+              "function": {"name": "other_tool", "arguments": "{}"}}]
+    assert yap._detect_yap_done(done) is True
+    assert yap._detect_yap_done(other) is False
     assert yap._detect_yap_done([]) is False
-
-    # Test with None
     assert yap._detect_yap_done(None) is False
 
 
-def test_cancel_during_retry_backoff(mock_llm_server):
-    """Regression: cancel during tenacity retry backoff must unblock immediately."""
-    import requests
+def test_cancel_during_retry_backoff(server):
+    """Regression: cancel during tenacity backoff must unblock immediately."""
+    server.script = [[{"status": 502}]]  # repeats
 
-    server, port = mock_llm_server
-    server.scenario = "always_502"
+    cancel_event = threading.Event()
+    session = requests.Session()
+    payload = yap._build_payload("test-model", [{"role": "user", "content": "hi"}])
 
-    original_url = yap.API_URL
-    yap.API_URL = f"http://localhost:{port}/v1/chat/completions"
+    def cancel_after_first_failure():
+        time.sleep(0.3)
+        cancel_event.set()
+        session.close()
 
-    try:
-        cancel_event = threading.Event()
-        session = requests.Session()
-        payload = yap._build_payload("test-model", [{"role": "user", "content": "hi"}])
+    cancel_thread = threading.Thread(target=cancel_after_first_failure)
+    cancel_thread.start()
 
-        # Cancel after the first 502 triggers tenacity backoff
-        def cancel_after_first_failure():
-            time.sleep(0.3)
-            cancel_event.set()
-            session.close()
+    start = time.time()
+    with pytest.raises(Exception):
+        yap._http_chat(yap.API_URL, payload, 5, session, cancel_event)
+    elapsed = time.time() - start
 
-        cancel_thread = threading.Thread(target=cancel_after_first_failure)
-        cancel_thread.start()
+    cancel_thread.join()
 
-        start = time.time()
-        with pytest.raises(Exception):
-            yap._http_chat(yap.API_URL, payload, 5, session, cancel_event)
-        elapsed = time.time() - start
-
-        cancel_thread.join()
-
-        # Must finish in under 1s — tenacity's min backoff is 2s,
-        # so if cancel didn't interrupt the sleep this would take 2s+
-        assert elapsed < 1.0, f"Cancel took {elapsed:.1f}s, should be <1s"
-    finally:
-        yap.API_URL = original_url
+    # Must finish in under 1s — tenacity's min backoff is 2s,
+    # so if cancel didn't interrupt the sleep this would take 2s+
+    assert elapsed < 1.0, f"Cancel took {elapsed:.1f}s, should be <1s"
