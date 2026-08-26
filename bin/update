@@ -22,6 +22,23 @@ DEPSPATH=$(nix path-info .#deps)
 HASH=$(nix hash path "$DEPSPATH")
 echo "   Got hash: $HASH"
 
+# Sanity: every pinned version must have a wheel in the FOD. Guards against
+# recording a hash from a build that saw a stale requirements.txt (this
+# happened once — certifi pin vs FOD contents diverged, nix run broke).
+MISSING=0
+while IFS= read -r req; do
+  pkg="${req%%==*}"
+  ver="${req#*==}"
+  if ! ls "$DEPSPATH" | grep -q "^${pkg}-${ver}-"; then
+    echo "   WARNING: $pkg==$ver has no matching wheel in FOD"
+    MISSING=1
+  fi
+done < <(grep -oE '^[a-zA-Z0-9._-]+==[^ \\]+' requirements.txt)
+if [ "$MISSING" = "1" ]; then
+  echo "FOD contents do not match requirements.txt — refusing to record hash."
+  exit 1
+fi
+
 echo "5. Updating flake.nix..."
 sed -i "s|outputHash = \".*\";|outputHash = \"$HASH\";|" flake.nix
 

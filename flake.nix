@@ -30,7 +30,7 @@
             mkdir $out
             python3 -m pip download -r requirements.txt -d $out
           '';
-          outputHash = "sha256-vLsXiGlaqtquhcc9fpWMH+nTXJruInewRPfz+wyXvEs=";
+          outputHash = "sha256-mS56FWL+1rcEggohp+rEfziNabmFfKNLzE2KTtPLj2k=";
           outputHashMode = "recursive";
           outputHashAlgo = "sha256";
           dontFixup = true;
