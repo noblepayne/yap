@@ -151,6 +151,8 @@ payloads encode wrong assumptions (this has bitten us).
   (hermes, bifrost). Record new ones with `bin/probe --record`.
 - `bin/probe` — probe a live endpoint before using it: list models, time a
   5-token stream, report latency-to-first-delta and whether it truly streams.
+  `--verify <fixture>` replays a captured fixture against the live endpoint
+  and reports shape drift (exit 0 match / 1 drifted).
   Check assumptions first; don't guess URLs/models/timeouts.
 
 Don't mock HTTP. Spin up the local server instead.

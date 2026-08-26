@@ -10,16 +10,159 @@ Usage:
     bin/probe <url> <model> [--key <api_key>] [--record <fixture_name>]
     bin/probe http://100.65.102.108:8642/v1 hermes-agent --key Ez4h...
     bin/probe http://prism:8080/v1 groq/openai/gpt-oss-120b --record bifrost_probe
+
+Fixture staleness check (replays a captured fixture against the live
+endpoint and compares response shape; exit 0 = match, 1 = drift):
+    bin/probe http://prism:8080/v1 groq/openai/gpt-oss-120b --verify bifrost_text
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 
 import requests
+
+FIXTURES_DIR = Path(__file__).parent.parent / "tests" / "fixtures"
+
+
+def load_fixture_events(name: str):
+    """Load a fixture's events + provenance from its header comments.
+
+    Returns (events, provenance_dict). Raises on structural problems —
+    a fixture that doesn't parse is stale by definition.
+    """
+    path = FIXTURES_DIR / f"{name}.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"no such fixture: {path}")
+    events, header_text = [], ""
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            header_text += line + "\n"
+            continue
+        if line == "data: [DONE]":
+            continue
+        if line.startswith("data: "):
+            line = line[len("data: "):]
+        events.append(json.loads(line))  # raises JSONDecodeError if rotten
+
+    provenance = {}
+    m = re.search(r"model:\s*([^|\n]+)", header_text)
+    if m:
+        provenance["model"] = m.group(1).strip()
+    m = re.search(r'prompt:\s*"([^"]*)"', header_text)
+    if m:
+        provenance["prompt"] = m.group(1)
+    m = re.search(r"captured:\s*([^|\n]+)", header_text)
+    if m:
+        provenance["captured"] = m.group(1).strip()
+    return events, provenance
+
+
+def sse_features(events):
+    """Shape summary used for fixture-vs-live comparison."""
+    delta_keys, finishes, usage = set(), set(), False
+    for e in events:
+        if isinstance(e.get("usage"), dict) and e["usage"]:
+            usage = True
+        for ch in e.get("choices") or []:
+            delta_keys |= set((ch.get("delta") or {}).keys())
+            if ch.get("finish_reason"):
+                finishes.add(ch["finish_reason"])
+    return {"delta_keys": delta_keys, "finish_reasons": finishes, "usage": usage}
+
+
+def collect_live_stream(url, model, prompt, headers, max_tokens=100):
+    """Stream a full response; return (parsed_chunks, note) where note
+    explains any fallback/anomaly."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+        "max_tokens": max_tokens,
+    }
+    r = requests.post(url, json=payload, headers=headers, timeout=120, stream=True)
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}"
+    if "text/event-stream" not in r.headers.get("Content-Type", ""):
+        return [], f"NOT SSE ({r.headers.get('Content-Type')}) — endpoint ignores stream:true"
+    chunks = []
+    for line in r.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data:"):
+            continue
+        body = line[len("data:"):].strip()
+        if body == "[DONE]":
+            break
+        try:
+            chunks.append(json.loads(body))
+        except json.JSONDecodeError:
+            continue
+    return chunks, "SSE ok"
+
+
+def verify(url_base: str, model_arg: str, api_key: str | None, fixture: str) -> int:
+    """Compare a captured fixture against the live endpoint's shape."""
+    url = f"{url_base}/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    print(f"\n{'─' * 60}")
+    print(f"  Verifying fixture: {fixture}.jsonl")
+    print(f"  Against: {url}")
+    print(f"{'─' * 60}")
+
+    try:
+        events, prov = load_fixture_events(fixture)
+    except FileNotFoundError as e:
+        print(f"\n✗ {e}")
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"\n✗ Fixture is structurally rotten (invalid JSON): {e}")
+        return 1
+
+    print(f"\n▸ Fixture: {len(events)} events OK", end="")
+    if prov.get("captured"):
+        print(f" · captured {prov['captured']}", end="")
+    print()
+
+    model = prov.get("model") or model_arg
+    if model != model_arg and model_arg:
+        print(f"  (using fixture's model {model!r}, overriding CLI {model_arg!r})")
+    prompt = prov.get("prompt") or "Say hello"
+    print(f"  replaying model={model!r} prompt={prompt!r}")
+
+    live, note = collect_live_stream(url, model, prompt, headers)
+    if live is None:
+        print(f"\n✗ Live check failed: {note}")
+        return 1
+
+    fx, lv = sse_features(events), sse_features(live)
+    drifted = False
+
+    def report(label, fx_val, lv_val):
+        nonlocal drifted
+        match = fx_val == lv_val
+        drifted |= not match
+        mark = "MATCH" if match else "DRIFT"
+        print(f"  {label:<14} fixture={fx_val}  live={lv_val}  → {mark}")
+
+    print(f"\n▸ Live: {len(live)} events · {note}\n")
+    report("delta keys", sorted(fx["delta_keys"]), sorted(lv["delta_keys"]))
+    report("finish", sorted(fx["finish_reasons"]), sorted(lv["finish_reasons"]))
+    report("usage", fx["usage"], lv["usage"])
+
+    print(f"\n{'─' * 60}")
+    if drifted:
+        print("  VERDICT: DRIFTED — upstream behavior changed; consider re-capturing")
+    else:
+        print("  VERDICT: MATCH — fixture still represents the live endpoint")
+    print(f"{'─' * 60}\n")
+    return 1 if drifted else 0
 
 
 def probe(url_base: str, model: str, api_key: str | None = None, record: str | None = None):
@@ -157,7 +300,17 @@ if __name__ == "__main__":
     parser.add_argument("model", help="Model name to test")
     parser.add_argument("--key", help="API key (or set via YAP_API_KEY env)")
     parser.add_argument("--record", help="Record stream fixture to tests/fixtures/<name>.jsonl")
+    parser.add_argument(
+        "--verify",
+        metavar="FIXTURE",
+        help="Replay a captured fixture against the live endpoint and report drift "
+        "(exit 0 = match, 1 = drift)",
+    )
     args = parser.parse_args()
 
     api_key = args.key or os.environ.get("YAP_API_KEY", "")
+
+    if args.verify:
+        sys.exit(verify(args.url, args.model, api_key or None, args.verify))
+
     probe(args.url, args.model, api_key=api_key or None, record=args.record)
