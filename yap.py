@@ -27,17 +27,17 @@ from tenacity import (
 )
 from textual import on
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.reactive import reactive
 from textual.widgets import (
     Button,
+    Collapsible,
     Footer,
     Header,
     Input,
     Markdown,
     RadioButton,
     RadioSet,
-    RichLog,
     Static,
     Switch,
     TextArea,
@@ -825,11 +825,33 @@ class Yap(App):
         border: solid $accent;
     }
 
-    #chat-history {
+    #transcript {
         height: 1fr;
-        background: transparent;
         padding: 0 1;
-        border: none;
+    }
+
+    /* Markdown is a plain Widget in textual >=8.x and grows with content.
+       Pin the intent so a future ScrollView revert can't silently break. */
+    #transcript Markdown.assistant-md {
+        height: auto;
+    }
+
+    #transcript-empty {
+        color: $text-disabled;
+        padding: 1 1;
+    }
+
+    .reasoning-block {
+        border-left: thick $panel;
+        margin: 0 0 0 1;
+    }
+
+    .reasoning-block.suppressed {
+        display: none;
+    }
+
+    #config.collapsed {
+        display: none;
     }
 
     #stream-pane {
@@ -892,13 +914,6 @@ class Yap(App):
         min-height: 10;
     }
 
-    .header-text {
-        text-align: center;
-        text-style: bold;
-        color: $accent;
-        margin-bottom: 1;
-    }
-
     #button-row {
         height: auto;
         layout: horizontal;
@@ -912,6 +927,7 @@ class Yap(App):
         ("ctrl+u", "clear_input", "Clear Input"),
         ("ctrl+p", "toggle_push", "Toggle Push"),
         ("ctrl+m", "toggle_debug", "Toggle Metadata"),
+        ("ctrl+g", "toggle_config", "Toggle Config"),
         ("y", "copy_last_response", "Copy Last"),
         ("Y", "copy_transcript", "Copy All"),
         ("ctrl+enter", "send", "Send"),
@@ -936,6 +952,9 @@ class Yap(App):
         self.session_id = derive_session_id(HISTORY_FILE)
         self.last_obs: ObsState = empty_obs()
         self._load_history()
+        # Incremental transcript tracking (see _refresh_chat_display)
+        self._rendered_count = 0
+        self._rendered_tail = None
         logging.info(
             f"YAP_PROVIDER={YAP_PROVIDER} session_id={self.session_id} "
             f"history_file={HISTORY_FILE}"
@@ -948,8 +967,8 @@ class Yap(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal():
-            with Vertical(id="config"):
-                yield Static("CONFIG", classes="header-text")
+            with Vertical(id="config") as config_panel:
+                config_panel.border_title = "config"
                 yield Static("Model Selection:")
                 with RadioSet(id="model-select"):
                     yield RadioButton("OpenRouter Free", value=True, id="model-free")
@@ -977,15 +996,19 @@ class Yap(App):
                 yield Button("Load History", id="load-history", variant="primary")
                 yield Static("Context: 0 chars | ~0 tokens", id="context-stats")
             with Vertical(id="main"):
-                with Vertical(id="chat-container"):
-                    yield Static("CONVERSATION", classes="header-text")
-                    yield RichLog(id="chat-history", highlight=False, wrap=True)
+                with Vertical(id="chat-container") as chat_panel:
+                    chat_panel.border_title = "conversation"
+                    with VerticalScroll(id="transcript"):
+                        yield Static(
+                            "Session started. No messages yet.",
+                            id="transcript-empty",
+                        )
                     yield Markdown("", id="stream-pane", classes="stream-pane")
                     yield Static(id="metadata-debug", classes="debug-info")
                 yield Static("Push Mode:")
                 yield Button("Push Mode: Off", id="push-mode-toggle", variant="default")
-                with Vertical(id="input-container"):
-                    yield Static("INPUT", classes="header-text")
+                with Vertical(id="input-container") as input_panel:
+                    input_panel.border_title = "input"
                     yield ChatInput(id="user-input")
                 yield Static(id="status", classes="normal")
         yield Footer()
@@ -1042,7 +1065,10 @@ class Yap(App):
     @on(Switch.Changed, "#show-reasoning")
     def _on_show_reasoning_changed(self, event: Switch.Changed) -> None:
         self.show_reasoning = event.value
-        self._refresh_chat_display()
+        # Pure CSS flip — no transcript rebuild. Blocks mounted while the
+        # toggle was OFF already carry the suppressed class.
+        for block in self.query(".reasoning-block"):
+            block.set_class(not event.value, "suppressed")
 
     def watch_is_loading(self, loading: bool) -> None:
         status = self.query_one("#status", Static)
@@ -1464,6 +1490,10 @@ class Yap(App):
                     self._http_session.close()
             self._update_status_text("Cancelled", "normal")
 
+    def action_toggle_config(self) -> None:
+        """Show/hide the config sidebar; transcript takes full width."""
+        self.query_one("#config", Vertical).toggle_class("collapsed")
+
     def action_toggle_debug(self) -> None:
         """Toggle metadata debug view."""
         self.debug_mode = not self.debug_mode
@@ -1501,65 +1531,111 @@ class Yap(App):
         self.exit()
 
     def _refresh_chat_display(self) -> None:
-        log = self.query_one("#chat-history", RichLog)
-        log.clear()
-        self._write_transcript(log)
+        transcript = self.query_one("#transcript", VerticalScroll)
+        empty = self.query_one("#transcript-empty", Static)
+
+        if not self.history:
+            self._clear_transcript(transcript, keep=empty)
+            empty.display = True
+            self._rendered_count = 0
+            self._rendered_tail = None
+        elif self._is_appendable():
+            for msg in self.history[self._rendered_count:]:
+                self._append_message_widgets(transcript, msg)
+            empty.display = False
+            self._rendered_count = len(self.history)
+            self._rendered_tail = self.history[-1]
+        else:
+            # Head shifted (truncation), wholesale replace (load), or any
+            # other desync — full rebuild is the only safe path.
+            self._clear_transcript(transcript, keep=empty)
+            empty.display = False
+            for msg in self.history:
+                self._append_message_widgets(transcript, msg)
+            self._rendered_count = len(self.history)
+            self._rendered_tail = self.history[-1] if self.history else None
+
+        # Stream-pane reset happens in BOTH branches — the in-flight pane
+        # must never outlive its completed message.
         stream = self.query_one("#stream-pane", Markdown)
         stream.update("")
         stream.remove_class("streaming")
+
+        self.call_after_refresh(transcript.scroll_end, animate=False)
         self._refresh_metadata_display()
 
-    def _write_transcript(self, log: RichLog) -> None:
-        """Render history as styled segments. Text objects, never markup
-        strings — model output may contain square brackets."""
-        if not self.history:
-            log.write(Text("Session started. No messages yet.", style="dim"))
-            return
-        for msg in self.history:
-            role = msg.get("role", "UNKNOWN").upper()
-            content = msg.get("content") or ""
-            tool_calls = msg.get("tool_calls")
-            thoughts, display_text = _extract_thoughts(content)
+    def _is_appendable(self) -> bool:
+        """True when history strictly extends what's already rendered.
 
-            reasoning_api = msg.get("reasoning_content") or msg.get("thought")
-            if reasoning_api:
-                thoughts.append(_strip_ansi(str(reasoning_api)))
+        Object identity against a strong ref (never id() — addresses get
+        reused after GC). Catches truncation head-shifts and wholesale
+        loads; count alone would silently go stale at MAX_HISTORY.
+        """
+        n = self._rendered_count
+        return n > 0 and len(self.history) >= n and self.history[n - 1] is self._rendered_tail
 
-            header_style = {
-                "USER": "bold cyan",
-                "ASSISTANT": "bold green",
-                "TOOL": "bold yellow",
-            }.get(role, "bold white")
-            log.write(Text(f"[{role}]", style=header_style))
+    def _clear_transcript(self, transcript: VerticalScroll, *, keep: Static) -> None:
+        for child in list(transcript.children):
+            if child is not keep:
+                child.remove()
 
-            if thoughts and self.show_reasoning:
-                log.write(Text("\n".join(thoughts), style="dim italic"))
-            elif thoughts:
-                log.write(Text("…thinking suppressed…", style="dim"))
+    def _append_message_widgets(self, transcript: VerticalScroll, msg: dict) -> None:
+        """Mount one history message as widgets. Model-derived text goes in
+        Text renderables / Markdown source — never markup strings."""
+        role = msg.get("role", "UNKNOWN").upper()
+        content = msg.get("content") or ""
+        tool_calls = msg.get("tool_calls")
+        thoughts, display_text = _extract_thoughts(content)
 
-            if display_text.strip():
-                log.write(Text(display_text))
+        reasoning_api = msg.get("reasoning_content") or msg.get("thought")
+        if reasoning_api:
+            thoughts.append(_strip_ansi(str(reasoning_api)))
 
-            for call in tool_calls or []:
-                call_id = call.get("id", "no-id")
-                line = Text(_format_tool_call(call), style="magenta")
-                line.append(Text(f"  [CALL:{call_id}]", style="dim"))
-                log.write(line)
+        widgets = []
 
-            if role == "TOOL":
-                name = msg.get("name", "unknown")
-                log.write(
-                    Text(f"tool result · {name}", style="dim italic yellow")
-                )
-            log.write(Text("─" * 40, style="dim"))
+        header_style = {
+            "USER": "bold cyan",
+            "ASSISTANT": "bold green",
+            "TOOL": "bold yellow",
+        }.get(role, "bold white")
+        widgets.append(Static(Text(f"[{role}]", style=header_style)))
+
+        if thoughts:
+            chars = sum(len(t) for t in thoughts)
+            collapsible = Collapsible(
+                Static(Text("\n".join(thoughts), style="dim italic")),
+                title=f"reasoning ({chars:,} chars)",
+                collapsed=True,
+                classes="reasoning-block",
+            )
+            if not self.show_reasoning:
+                collapsible.add_class("suppressed")
+            widgets.append(collapsible)
+        elif not self.show_reasoning:
+            pass  # suppression marker lives on the clipboard path, not screen
+        if display_text.strip():
+            widgets.append(Markdown(display_text, classes="assistant-md"))
+
+        for call in tool_calls or []:
+            call_id = call.get("id", "no-id")
+            line = Text(_format_tool_call(call), style="magenta")
+            line.append(Text(f"  [CALL:{call_id}]", style="dim"))
+            widgets.append(Static(line))
+
+        if role == "TOOL":
+            name = msg.get("name", "unknown")
+            widgets.append(Static(Text(f"tool result · {name}", style="dim italic yellow")))
+
+        widgets.append(Static(Text("─" * 40, style="dim")))
+        transcript.mount(*widgets)
 
     def _update_stream_display(self, text: str) -> None:
         """Update only the in-flight response pane — O(current message),
-        never a full transcript rebuild."""
+        never a transcript rebuild. (Markdown is not a ScrollView in
+        textual >=8; growth is handled by height:auto.)"""
         stream = self.query_one("#stream-pane", Markdown)
         stream.update(f"{text}\n▌")
         stream.add_class("streaming")
-        stream.scroll_end(animate=False)
 
     def _refresh_context_stats(self) -> None:
         system_prompt = self.query_one("#system-prompt", TextArea).text
